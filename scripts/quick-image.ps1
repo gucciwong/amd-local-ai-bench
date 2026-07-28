@@ -36,7 +36,9 @@ param(
   # 出图模型。实测对比见 docs/benchmark.md：
   #   turbo-gguf : 与 turbo 同速但省 1.6GB 显存 —— 默认
   #   turbo      : 未量化原版
-  #   sdxl       : 画质明显更好，但慢 4.5 倍、显存 7.14GB（8GB 卡余量很小）
+  #   sdxl       : 画质明显更好，但本脚本走 CLI 路径时极慢（512 图实测 825s）。
+  #                SDXL 请改用服务端 API（同样 512 只要 14.8s），别用这个脚本。
+  #                原因未查明，属已知的 CLI/服务端性能差异，见 docs/benchmark.md
   [ValidateSet('turbo-gguf', 'turbo', 'sdxl')]
   [string]$Model = 'turbo-gguf',
 
