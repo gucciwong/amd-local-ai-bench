@@ -1,0 +1,67 @@
+name: 提交基准数据
+description: 在你的 AMD 显卡上跑 collect.ps1，把结果贴上来
+title: "[数据] "
+labels: ["submission"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢提交。目前本仓库只有**一块显卡**的数据，
+        所以每一条新数据都可能推翻或限定现有结论。
+
+        **先跑脚本再来填**：
+
+        ```powershell
+        git clone https://github.com/gucciwong/amd-local-ai-bench
+        cd amd-local-ai-bench
+        .\scripts\collect.ps1 -Quick -Note "你的显卡型号"
+        ```
+
+        脚本会自动探测硬件、每个用例前重启服务，导出的 JSON
+        **不含任何路径、用户名或个人信息**（格式见 [docs/schema.md](../blob/main/docs/schema.md)）。
+
+  - type: textarea
+    id: json
+    attributes:
+      label: collect.ps1 导出的 JSON
+      description: 直接把文件内容整个贴进来，不要删字段（`ok:false` 的条目也请保留，失败本身是数据）
+      render: json
+    validations:
+      required: true
+
+  - type: input
+    id: connection
+    attributes:
+      label: 显卡怎么接的
+      description: 这一项 JSON 里没有，但很关键——目前所有结论都来自 Thunderbolt eGPU，无法区分「独显特性」与「雷电总线特性」
+      placeholder: 例如：主板 PCIe x16 直插 / Thunderbolt 4 外接坞 / OCuLink 外接
+    validations:
+      required: true
+
+  - type: dropdown
+    id: gtt
+    attributes:
+      label: 试过 enable_dgpu_gtt=true 吗
+      description: 本仓库最想被验证的一条——我这台机器上开启后出图从 2.73s 崩到 158s（58 倍）
+      options:
+        - 没试过
+        - 试过，同样严重变慢
+        - 试过，没有明显影响
+        - 试过，反而变快了
+    validations:
+      required: true
+
+  - type: input
+    id: ceiling
+    attributes:
+      label: 出图分辨率上限
+      description: 逐级加大直到失败。我这块 8GB 卡卡在 2816²，失败于 Vulkan 的 5 GiB 单次分配上限而非显存耗尽
+      placeholder: 例如：4096² 成功，4608² 失败 / 没测
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: 其他观察
+      description: |
+        特别欢迎与仓库结论**不一致**的发现。写错的结论比没有结论更有害，
+        所以如果你的数据推翻了某条，请直说，我会改文档并注明。

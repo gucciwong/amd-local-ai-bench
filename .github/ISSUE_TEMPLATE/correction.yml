@@ -1,0 +1,56 @@
+name: 指出结论有误
+description: 仓库里某条结论与你的实测不符
+title: "[订正] "
+labels: ["correction"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        本仓库的每条结论都只是**单点观测**（一块 RX 7600M XT，一台机器，Windows）。
+        被推翻是预期之内的。
+
+        这个模板存在的理由：写错的结论比没有结论更有害，
+        因为别人会照着它做决定。
+
+  - type: input
+    id: claim
+    attributes:
+      label: 哪条结论
+      description: 贴原文或给出文件与小节
+      placeholder: 例如：docs/benchmark.md 第六节「enable_dgpu_gtt=true 慢 58 倍」
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 你的实测结果
+      description: 数字 + 测量方式。如果能跑 `collect.ps1` 就更好
+    validations:
+      required: true
+
+  - type: textarea
+    id: setup
+    attributes:
+      label: 你的环境
+      description: 显卡型号与显存、怎么接的、操作系统、驱动版本、Lemonade 版本
+      placeholder: |
+        显卡：RX 7900 XTX 24GB
+        连接：主板 PCIe x16 直插
+        系统：Windows 11 / Ubuntu 24.04
+        驱动：
+        Lemonade：
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: methodology
+    attributes:
+      label: 测量前置条件
+      description: |
+        本项目栽过的两个坑，都会让数据差几十倍。勾选你确认做到的项——
+        没做到也可以提交，我会在结论里标注置信度。
+      options:
+        - label: 每个配置前重启了 Lemonade 服务（残留模型会让同一配置差 58 倍）
+        - label: 测量前显存是空的（两个进程争显存曾让同一任务差 34 倍）
+        - label: 对比两条执行路径时，核对过双方进程的真实命令行参数
