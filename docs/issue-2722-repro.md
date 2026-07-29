@@ -88,14 +88,16 @@ So the `sd-cpp` half of the install works; only the TheRock/ROCm runtime half fa
 4. The reporter of this issue is on **gfx1151**; I'm on **gfx1102**. Two
    different architectures, two different bundles, same extraction failure.
 
-### Attempted workarounds (all unsuccessful)
+### Workarounds considered
 
-- `lemonade backends install sd-cpp:rocm --force` — same failure
-  (`--force` only bypasses hardware filtering, which was never the blocker)
-- No CLI flag exists to pin an alternate ROCm/TheRock version
-- `rocm_channel` is `stable`; switching channels is reported broken in
+- No CLI flag exists to pin an alternate ROCm/TheRock version.
+- `rocm_channel` is `stable`; switching to nightly is reported broken in
   [#1902](https://github.com/lemonade-sdk/lemonade/issues/1902)
-  (`backend_versions.json is missing version for: sd-cpp:rocm-nightly`)
+  (`backend_versions.json is missing version for: sd-cpp:rocm-nightly`).
+- `--force` is documented as bypassing *hardware filtering*, which is not the
+  blocker here (the backend already shows as `installable`), so it is unlikely
+  to help. I attempted to confirm this but the run was interrupted by unrelated
+  local activity, so **I have not verified it** and am not claiming a result.
 
 ### Suggestion
 
