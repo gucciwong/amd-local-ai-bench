@@ -36,11 +36,14 @@ param(
   # 出图模型。实测对比见 docs/benchmark.md：
   #   turbo-gguf : 与 turbo 同速但省 1.6GB 显存 —— 默认
   #   turbo      : 未量化原版
-  #   sdxl       : 画质明显更好，但本脚本走 CLI 路径时极慢（512 图实测 825s）。
-  #                SDXL 请改用服务端 API（同样 512 只要 14.8s），别用这个脚本。
-  #                原因未查明，属已知的 CLI/服务端性能差异，见 docs/benchmark.md
-  [ValidateSet('turbo-gguf', 'turbo', 'sdxl')]
+  #   sdxl       : 画质好但占 7.16GB；8GB 卡上必须独占显存才跑得动
+  #   sdxl-turbo : SDXL 级画质 + Turbo 速度，画质档首选
+  [ValidateSet('turbo-gguf', 'turbo', 'sdxl', 'sdxl-turbo')]
   [string]$Model = 'turbo-gguf',
+
+  # 跑之前不要卸载 Lemonade 里常驻的模型。
+  # 默认会卸载：实测两个进程争 8GB 显存会让 SDXL 从 24s 劣化到 825s（34 倍）
+  [switch]$KeepResident,
 
   # 基础生成尺寸。512 是 SD-Turbo 的训练分辨率，速度/质量最划算。
   # 用 -Model sdxl 时建议 1024（SDXL 的原生分辨率）
@@ -85,9 +88,26 @@ $hf = Join-Path $cacheRoot "huggingface"
 # 各模型的实际权重文件名。lemonade pull 之后落在 HF 缓存里，
 # 文件名与模型名并不一致，所以这里显式映射
 $modelFile = switch ($Model) {
-  'turbo-gguf' { 'sd_turbo-f16-q8_0.gguf' }
-  'turbo'      { 'sd_turbo.safetensors' }
-  'sdxl'       { 'sd_xl_base_1.0.safetensors' }
+  'turbo-gguf'  { 'sd_turbo-f16-q8_0.gguf' }
+  'turbo'       { 'sd_turbo.safetensors' }
+  'sdxl'        { 'sd_xl_base_1.0.safetensors' }
+  'sdxl-turbo'  { 'sd_xl_turbo_1.0_fp16.safetensors' }
+}
+
+# 显存争用是本项目遇到的最大性能陷阱：sd-cli 与 Lemonade 常驻的 sd-server
+# 同时各要 6-7GB，8GB 卡直接崩到 1/34 速度。默认先让服务端腾出显存。
+if (-not $KeepResident) {
+  $cli = Join-Path $env:LOCALAPPDATA "lemonade_server\bin\lemonade.exe"
+  if (Test-Path $cli) {
+    try {
+      $loaded = & $cli status 2>&1 | Select-String -Pattern '^\s*(\S+)\s+(image|text)\s' |
+                ForEach-Object { $_.Matches[0].Groups[1].Value }
+      foreach ($lm in $loaded) {
+        Write-Host "  卸载常驻模型 $lm 以释放显存（-KeepResident 可跳过）" -ForegroundColor DarkGray
+        & $cli unload $lm 2>&1 | Out-Null
+      }
+    } catch { }
+  }
 }
 # 注意用独立变量名：$Model 带 ValidateSet，赋路径进去会触发校验失败
 $modelPath = Resolve-One -Root $hf -Filter $modelFile -What "$Model 模型（$modelFile）"
