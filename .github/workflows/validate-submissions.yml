@@ -1,0 +1,69 @@
+name: validate-submissions
+
+# 有人提交基准数据时，先机器过一遍：
+#   - 是不是 UTF-8、JSON 合不合法
+#   - schema 版本认不认识
+#   - 归组必需的配置键在不在（缺了就没法和别人的数据比）
+#   - 有没有不小心带上本机路径或邮箱
+#
+# 刻意只在「数据无法比较」或「泄露个人信息」时判红。
+# 其余一律 warning —— 这是个求人贡献数据的仓库，
+# 因为一个可选字段就把 PR 判红，贡献者下次就不来了。
+
+on:
+  pull_request:
+    paths:
+      - "submissions/**"
+      - "scripts/validate_submission.py"
+      - ".github/workflows/validate-submissions.yml"
+  push:
+    branches: [main]
+    paths:
+      - "submissions/**"
+      - "scripts/validate_submission.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # 校验器只用标准库，不装依赖
+      - name: Validate submissions
+        run: python scripts/validate_submission.py
+
+  # 脚本本身也要能跑。语法错误会让上面的 job 以「通过」的假象跳过检查。
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Reject a deliberately broken submission
+        run: |
+          mkdir -p /tmp/bad
+          # 缺 lemonade.config，且带了 Windows 用户路径
+          cat > /tmp/bad/broken.json <<'EOF'
+          {
+            "schema": "localai-bench/1",
+            "note": "C:\\Users\\someone\\bench.json",
+            "gpus": [{"name": "AMD Radeon RX 9999"}],
+            "results": [{"kind": "image", "model": "X", "ok": true, "seconds": 1.0}]
+          }
+          EOF
+          if python scripts/validate_submission.py /tmp/bad/broken.json; then
+            echo "校验器放行了本该拒绝的文件" >&2
+            exit 1
+          fi
+          echo "校验器正确拒绝了坏样本"
