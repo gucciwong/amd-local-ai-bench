@@ -35,6 +35,12 @@
   **execution path 不完全对等**（见下方"已知边界"），比较时如实标注了
   这一点，没有把它包装成一个干净的倍数结论。
 
+- **追了一层根因，排除了两个假设**：不是 MIOpen（压根没链接进
+  `sd-cli`，卷积走的是 ggml 自己的 im2col+GEMM）；也基本不是精度
+  （模型文件确认是 F32，强制 `--type f16` 只把 10.1s 降到 8.5s，
+  离 2.47s 还差一大截）。真正差距大概率在 hipBLAS/rocBLAS 对 UNet
+  不规则形状的调优程度，这层没有用 rocprof 坐实，留作下一轮。
+
 ## 为什么之前判断"WSL 不支持 gfx1102"是错的
 
 查证过程中，多个信号指向"gfx1102 被排除在 WSL ROCm 支持外"：
@@ -139,6 +145,33 @@ cmake --build build --config Release -j$(nproc) --target sd-cli
 用脚本去驱动 WSL2 本身也有一整层容易被忽略的转发/转义坑，跟 GPU
 支不支持完全无关。
 
+## 出图为什么比 Vulkan 慢：排除了两个假设，没有第三个假设
+
+沿着"配置没调优 vs 内核本身慢"这条线，实测排除了两个具体假设，
+而不是停在"待验证"：
+
+1. **不是 MIOpen 卷积核的问题——因为 MIOpen 根本没被链接进来。**
+   `ldd build/bin/sd-cli` 只看到 `libhipblas.so.3` / `librocblas.so.5` /
+   `libhipblaslt.so.1` / `libamdhip64.so.7`，`ggml-hip/CMakeLists.txt`
+   只 `find_package(hipblas REQUIRED)` + `find_package(rocblas REQUIRED)`，
+   全仓 `grep -ri miopen` 零命中。ggml 的卷积是自己拿 im2col+GEMM 实现的，
+   不经过 MIOpen——这条本来想验证的假设，验证方式变成了"证明它压根不适用"。
+
+2. **精度不是主因，但确实占一部分。** 模型文件本身用 Python 读
+   safetensors 头确认过是 **F32**（1229 个 tensor 全是 F32，不是运行时
+   默认猜的），跟 Vulkan 基线用的是同一个文件。补测 `--type f16`：
+   `sampling` 从 5.72s → **3.74s**，`generate_image` 从 10.10s → **8.5s**，
+   两次重复一致（8.53s / 8.46s）。**确实有提升（约 15-20%），但离
+   Vulkan 的 2.47s 还差 3.4 倍**——精度不是解释 3-4 倍差距的主因。
+
+排除了这两个之后，剩下的假设是：**hipBLAS/rocBLAS 在 UNet 里那些
+不规则形状（im2col 卷积、空间注意力）上的 GEMM 调优，或者 ggml-hip
+自己写的非 GEMM 算子（GroupNorm/SiLU/上采样等），比 ggml-vulkan 的
+coopmat 路径更没针对这类形状调优过。** 这一层没有再往下用 `rocprof`
+做逐算子耗时分解去坐实——那需要专门的 profiling 会话，
+超出了这次"测试能不能跑通"的范围。**留给下一轮：用 rocprof 对
+单步 sampling 做算子级分解，定位到底是卷积、注意力还是逐点算子。**
+
 ## 已知边界（这次没测的 / 没测严谨的）
 
 - **这是 WSL2，不是裸机 Linux**。WSL2 的 GPU 访问走 `/dev/dxg` 半虚拟化
@@ -150,9 +183,10 @@ cmake --build build --config Release -j$(nproc) --target sd-cli
   ROCm/WSL2 的 10.10s 来自 `sd-cli` **每次冷启动**的单次进程，其中
   包含一次 conditioner 张量的懒加载（约 3s，常驻服务不会重复付这笔
   开销）。刨去这部分，纯 `sampling`（5.72s，20 steps）+`decode`（1.79s）
-  ≈ 7.5s，仍比 Vulkan 慢约 3 倍——方向没变，只是没有去追查根因
-  （没有验证是 MIOpen/rocBLAS 卷积核在 RDNA3 消费卡上确实更慢，
-  还是只是这次没装到位/没调优），**留作待验证的问题，不是结论**
+  ≈ 7.5s，仍比 Vulkan 慢约 3 倍。已排除 MIOpen（根本没链接）和精度
+  （`--type f16` 只帮上 15-20%）两个假设，详见上面"出图为什么比
+  Vulkan 慢"一节；剩下"GEMM/自定义算子调优程度"这层**没有用 rocprof
+  做算子级分解去坐实**，是下一轮真正的待办
 - 只测了一块卡、每个配置只有 2-3 次重复，没有做本仓库其他结论要求的
   "每配置前重启服务"式多轮对照
 - Windows 原生的 `sd-cpp:rocm` 依然是坏的——**这条结论不变**
