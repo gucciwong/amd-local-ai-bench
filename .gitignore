@@ -2,3 +2,5 @@ health-log.csv
 *.png
 renders/
 bench-*.json
+__pycache__/
+*.pyc
