@@ -14,8 +14,9 @@
 | "开 `enable_dgpu_gtt` 让独显借系统内存" | **慢 58 倍**（2.73s → 158s），且并不能提高分辨率上限 |
 | "双显卡应该分工协作" | 拆分单个扩散任务在**所有场景都是负优化**（最多慢 3.6 倍） |
 | "反正 ROCm 在这块卡上就是不行" | **只说对了一半**——WSL2 上 ROCm/HIP 真实可用：LLM 打平甚至略快 Vulkan（36.4 vs 33-34 tok/s），但**出图反而慢约 3-4 倍**（10.1s vs Vulkan 2.47s）。Windows 原生这条路依然是坏的，两个方向的实测和坑都在 [docs/rocm-on-wsl2.md](docs/rocm-on-wsl2.md) |
-| "WSL2 上 ROCm 能训练吗" | **能，但要修一个坑**：pip 装的 torch wheel 自带一份不认 WSL2 的 `libhsa-runtime64.so`，抢在系统那份（已支持 WSL 的 ROCDXG 桥接）前面被加载，删掉它就通——`torch.cuda.is_available()` 变 `True`，4096 维 MLP + fp16 训练全部正确收敛。**这条结论我们自己也改过一次**：一开始误判成"硬阻塞、大概率无解"并据此发过一次修正，后来才找到真正的修复，过程见 [docs/training-methodologies.md](docs/training-methodologies.md) |
+| "WSL2 上 ROCm 能训练吗" | **能，但要修一个坑**：pip 装的 torch wheel 自带一份不认 WSL2 的 `libhsa-runtime64.so`，抢在系统那份（已支持 WSL 的 ROCDXG 桥接）前面被加载，删掉它就通——`torch.cuda.is_available()` 变 `True`。**这条结论我们自己也改过一次**：一开始误判成"硬阻塞、大概率无解"并据此发过一次修正，后来才找到真正的修复 |
 | 网上说 Vulkan flash-attention 在 AMD 上会回退 CPU、慢 60-97% | 这块卡上**没有重现**：短上下文两者打平，长上下文（4096）FA 只慢约 9%，量级完全不同——不要不测就把外部结论抄进自己的配置里 |
+| "DirectML 训练更省事，应该也更能打" | 修好的 WSL2/ROCm 上实测跑通了 **Unsloth 官方 AMD QLoRA 支持**（全网第一份 gfx1102 数据）；反倒是"更省事"的 `torch-directml` 在真实 transformer 模型上直接崩溃（`masked_fill` 报 `uint8_t overflow`，fp16/fp32/eager 三种配置复现同一个错误），过程见 [docs/training-methodologies.md](docs/training-methodologies.md) |
 
 ## 快速开始
 

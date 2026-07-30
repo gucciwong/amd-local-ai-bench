@@ -1,8 +1,10 @@
 # 在 AMD + Windows 上训练/微调模型：方法论盘点
 
 本仓库到目前为止全部是**推理**（LLM 生成、出图）。这篇是第一次往
-**训练/微调**方向挖。**两条路都实测能跑**：WSL2 上的 PyTorch-ROCm（需要一个
-不算显而易见的修复）和原生 Windows 上的 `torch-directml`（开箱即用）。
+**训练/微调**方向挖。**WSL2 上的 PyTorch-ROCm 训练真实能跑**（需要一个
+不算显而易见的修复），并且用它实测跑通了 Unsloth 官方 AMD QLoRA 支持——
+全网目前找不到第二份 gfx1102 数据。原生 Windows 上的 `torch-directml`
+对合成负载能训练，但对真实 transformer 模型撞上了一个可复现的崩溃。
 
 > 置信度标注延续 [benchmark.md](benchmark.md) 的规则：🟢 已对照/已复现，
 > 🟡 单轮，🔴 未验证/转述自调研。
@@ -19,9 +21,9 @@
 
 | 方法 | 状态 | 置信度 |
 |---|---|---|
-| PyTorch-ROCm 在 **WSL2** 上训练 | ✅ **能跑**——删掉 pip 轮子自带的 `libhsa-runtime64.so`，改用系统 ROCm 的 WSL 感知版本后，`torch.cuda.is_available()` 返回 `True`，4096 维 3 层 MLP + fp16 autocast 训练全部正确收敛 | 🟢 三个规模（玩具级/4096维/fp16）全部验证，含 GPU vs CPU 结果比对 |
-| `torch-directml`（原生 Windows） | ✅ **能跑，开箱即用**，无需任何修复；但确认了一个真实的算子静默回退 CPU 的案例（`aten::lerp.Scalar_out`，AdamW 内部用到） | 🟢 单次但含正确性验证+真实警告复现 |
-| Unsloth 官方 AMD 支持（RDNA3 QLoRA） | 未测 | 🔴 转述自调研，是下一轮最值得测的一项——**此前文档说"第一道门槛过不去"的判断已随上面的修复失效**，见文末 |
+| PyTorch-ROCm 在 **WSL2** 上训练 | ✅ **能跑**——删掉 pip 轮子自带的 `libhsa-runtime64.so`，改用系统 ROCm 的 WSL 感知版本后，`torch.cuda.is_available()` 返回 `True`，玩具 MLP + 4096维 MLP + fp16 autocast + 真实 transformer LoRA 训练全部正确收敛 | 🟢 四个规模全部验证，含 GPU vs CPU 结果比对 |
+| **Unsloth 官方 AMD 支持（RDNA3 QLoRA）** | ✅ **实测成功，全网第一份 gfx1102 数据**——Llama-3.2-1B 4-bit QLoRA，20 step，loss 4.84→0.84（含中间噪声但整体下降），11.3M/1.25B 可训练参数（0.90%），峰值显存 1.33GB | 🟢 完整训练循环跑通，Unsloth 自己的横幅确认识别到 `AMD Radeon RX 7600M XT`+ROCm 7.2 |
+| `torch-directml`（原生 Windows） | ⚠️ **对合成 MLP 能跑，对真实 transformer 模型崩溃**——`masked_fill` 在准备因果注意力掩码时报 `RuntimeError: value cannot be converted to type uint8_t without overflow`，fp16/fp32/eager 注意力实现都试过，同一个错误 | 🟢 合成 MLP 训练✅已验证；🟢 真实模型崩溃也已复现三次，非偶发 |
 | Microsoft Olive / ONNX Runtime | 未测，且据调研主要面向 NPU 不是这块独显 | 🔴 转述自调研 |
 | 原生 Windows ROCm（TheRock 之外，AMD 2025 新推的统一安装包） | 不适用 | 🔴 转述自调研——AMD 官方 Windows 支持矩阵明确只列 `gfx1100/1101/1200/1201`，**没有 gfx1102**，且即使是受支持的卡，原生 Windows 也只做推理，训练仍需 WSL2（但 WSL2 本身现在确认可行，见上） |
 
@@ -147,42 +149,123 @@ performance implications.
 静默回落 CPU"就会变成一个隐藏的性能陷阱——而且没有任何机制强制报错，
 纯粹是希望你去看 warning。
 
-## 两条路怎么选
-
-- **两条路都能训练**，方向不冲突：`torch-directml` 装起来更省事（无需
-  改运行时文件），`PyTorch-ROCm/WSL2` 装起来麻烦一点点（需要知道
-  ROCDXG 这个修复），但用的是"真"的 ROCm/HIP 计算栈而不是走 DirectX 12
-  这层转译，理论上算子覆盖和长期维护状态更接近 Linux 原生。
-- 本轮**没有做两者训练吞吐的正式对照**——玩具级 MLP 上 DirectML 表格上
-  的数字看起来比 WSL2/ROCm 快（0.337s vs 1.311s 完成 20 step），但样本
-  太小、太受 Python/调度开销主导，**不构成一个可信的性能结论**，只是
-  记录下来避免被误读成"DirectML 更快"的定论。真要比较需要一个有意义
-  规模的真实模型和多轮重复测量，留作下一轮。
-
-## 下一轮最值得测的一项：Unsloth 官方 AMD 支持
+## Unsloth 官方 AMD 支持：实测成功，全网第一份 gfx1102 数据
 
 调研翻出一个很新的进展：**Unsloth（LoRA/QLoRA 微调框架）联合 AMD
 官方推出了 AMD GPU 支持**，明确覆盖 RDNA3（含 gfx1102 所在的架构族）、
-Windows/WSL/Linux 三种环境（AMD 官方技术文章 2026，Unsloth 官方文档）。
-这是全网**目前找不到任何 gfx1102 实测数据**的空白点。
+Windows/WSL/Linux 三种环境。当时这是全网**找不到任何 gfx1102 实测数据**
+的空白点——现在补上了。
 
-依据 AMD 自己 tracking issue（`amd/gaia#667`）给出的显存目标，8GB 卡上
-现实的量级大概是：Qwen3-1.7B FP8 GRPO ≈5GB、Qwen3-4B QLoRA ≈4GB、
-**Qwen3-8B QLoRA ≈8GB**（贴着上限）——这些是 AMD 自己给的目标数字，
-**没有在这块卡上验证过**。
+在已经修好的 WSL2/ROCm 环境（见上）里装：
 
-**此前版本的文档认为这条路"第一道门槛就过不去"**（因为当时以为 WSL2 上
-PyTorch 连设备都枚举不到）——**这个判断随着上面的修复已经失效**：既然
-`torch.cuda.is_available()==True` 且训练循环真能跑，Unsloth 跑在 PyTorch
-之上，理论上应该也能装起来。真正剩下的门槛是：
+```bash
+pip install 'unsloth[amd]'
+pip install --force-reinstall --no-cache-dir --no-deps \
+  "https://github.com/bitsandbytes-foundation/bitsandbytes/releases/download/continuous-release_main/bitsandbytes-1.33.7.preview-py3-none-manylinux_2_24_x86_64.whl"
+```
 
-1. 预发布版 `bitsandbytes`（Unsloth 文档要求 ≥0.49.1，为了绕开 AMD 上
-   4-bit 解码的一个已知 NaN bug）——这个还没测过是否兼容我们这套
-   ROCDXG 修复后的环境
-2. Unsloth 自身的 HIP kernel（如果有自定义 CUDA/HIP 扩展）是否也会像
-   torch 官方 wheel 一样带着不兼容 WSL2 的运行时，需要同样的修复手法
-3. 一个能在 8GB 内跑完至少几十个 step 的小模型（先 Qwen2.5-0.5B/1.7B
-   验证反向传播能不能过，再考虑往 8B 冲）
+**一个真实的坑**：`pip install unsloth[amd]` 会**静默把已经修好的 ROCm
+torch 换成 PyPI 默认的 CUDA 版**（装出来是 `torch-2.11.0+cu130`，带一堆
+`nvidia-cublas`/`nvidia-cudnn` 依赖——这台机器根本没有 NVIDIA 显卡）。
+不是报错，是**安装成功但换了一个不能用的后端**，`torch.cuda.is_available()`
+变回 `False`。修法是装完 unsloth 后，**按 Unsloth 文档给的版本范围
+（ROCm 7.2+ 对应 `torch>=2.11.0,<2.12.0`）用 ROCm 专用 index 重新强制装回**：
+
+```bash
+pip install "torch>=2.11.0,<2.12.0" torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/rocm7.2 --upgrade --force-reinstall
+```
+
+再重复一遍前面那个"删掉 wheel 自带 `libhsa-runtime64.so`"的修复
+（每次重装 torch 都会带回一份新的自带运行时，需要重新删）。
+
+修好之后，跑一个真实的 QLoRA 微调（`unsloth/Llama-3.2-1B-Instruct`，
+4-bit，LoRA rank 16，20 step，玩具级指令数据集）：
+
+```
+==((====))==  Unsloth 2026.7.6: Fast Llama patching. Transformers: 5.5.0.
+   \\   /|    AMD Radeon RX 7600M XT. Num GPUs = 1. Max memory: 7.984 GB. Platform: Linux.
+O^O/ \_/ \    Torch: 2.11.0+rocm7.2. ROCm Toolkit: 7.2.26015. Triton: 3.6.0
+Trainable parameters = 11,272,192 of 1,247,086,592 (0.90% trained)
+```
+
+结果：20 step 跑完（首步 11.5s 含 Triton kernel JIT 编译，稳态后约
+0.3-0.5s/step），loss 从 `4.84` 降到 `0.84`（中间因为极小 batch+学习率
+预热有噪声，但整体明显下降），**峰值显存只用了 1.33GB**——对一块 8GB
+卡来说非常宽松，AMD 自己给的"Qwen3-8B QLoRA 贴着 8GB 上限"的量级，
+在 1B 模型上验证是完全用不满的，这个空间大小的对照后续可以往更大的
+模型上推。
+
+**过程中两个额外的真实信号**（都只是警告，不是阻塞）：
+
+- `Warning: Attempting to use CK on an unsupported architecture! Cannot
+  set backend to CK` —— AMD 自己的 Composable Kernel（CK）库明确不支持
+  gfx1102，自动回退到别的路径。呼应本仓库反复出现的模式："gfx1102 是
+  RDNA3 里被漏掉的那个"。
+- `Mem Efficient attention on Current AMD GPU is still experimental.
+  Enable it with TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` —— 一个
+  具体的、没试过的加速开关，留给下一轮。
+
+## 严谨的跨后端对照：撞上一个真实的 DirectML bug
+
+本来想做一个"真正公平"的 DirectML vs WSL2/ROCm 训练吞吐对照——不用
+Unsloth（AMD 专属，DirectML 没有）、不用 bitsandbytes 4-bit 量化
+（DirectML 不支持），改用最朴素的共同基准：裸 `transformers`+`peft`
+LoRA，同一个模型、同一套超参数、同一份脚本，只有 `device` 参数不同。
+
+**WSL2/ROCm 侧顺利跑完 3 轮**（每轮独立进程，模型下载后本地缓存）：
+
+| 轮次 | 耗时/step | 峰值显存 |
+|---|---|---|
+| 1 | 328.6 ms | 3823 MB |
+| 2 | 349.7 ms | 3823 MB |
+| 3 | 283.6 ms | 3823 MB |
+
+loss 轨迹三轮几乎完全一致（`5.01→1.47` 附近），显存峰值三轮完全相同——
+可复现性很好。
+
+**DirectML 侧跑不完——真实模型的前向传播直接崩溃**，跟精度、跟注意力
+实现选择都无关：
+
+```
+RuntimeError: value cannot be converted to type uint8_t without overflow
+```
+
+报错发生在 `transformers` 准备因果注意力掩码那一步
+（`_prepare_4d_causal_attention_mask_with_cache_position` 里的
+`masked_fill`）。为了排除是不是精度或注意力实现的问题，依次试了：
+
+1. fp16 → 同样的报错
+2. fp32 → 同样的报错（不是精度问题）
+3. `attn_implementation="eager"` → 同样的报错（掩码准备发生在选择哪种
+   注意力实现之前，跟这个参数无关）
+
+**三次复现都是完全相同的报错**，判断这是 DirectML 后端对这个特定
+`masked_fill` 用法（大概率是 `torch.finfo(dtype).min` 这种极端填充值）
+的一个真实、可复现的实现缺口——跟前面"`torch-directml`（原生 Windows）"
+一节测过的合成 MLP 能在 DirectML 上训练不矛盾，只是**真实 transformer
+模型用到的这个具体算子模式，DirectML 目前跑不通**。
+
+**这意味着本轮没能拿到一个"两边都跑完、比时间"的干净数字**——但这
+本身就是答案：与其说"DirectML 训练能跑，只是不知道多快"，不如说
+"DirectML 现在连这个最常见的 Llama 因果掩码模式都跑不过去"，这是一个
+比吞吐数字更重要的发现。没有进一步去 patch `transformers` 的掩码实现
+或深挖 DirectML 内核代码——那已经超出"做一次对照测试"的范围，留作
+边界记录。
+
+## 两条路怎么选
+
+- **两条路都能训练玩具级/合成负载**，但 `torch-directml` 在真实
+  transformer 模型上撞上了上面这个具体的 `masked_fill` 崩溃，
+  **PyTorch-ROCm/WSL2 是目前唯一验证过能跑真实模型（包括 Unsloth QLoRA）
+  的路径**。
+- `torch-directml` 装起来更省事（无需改运行时文件），但目前看到的两个
+  真实问题（`aten::lerp.Scalar_out` 静默回退 CPU + `masked_fill` 崩溃）
+  都指向"算子覆盖不完整"这条调研早就提醒过的线——这次是亲手撞上了，
+  不是转述。
+- `PyTorch-ROCm/WSL2` 装起来麻烦一点（ROCDXG 修复 + 每次重装 torch 都要
+  重新删 wheel 自带运行时），但走的是"真"的 ROCm/HIP 计算栈，目前是
+  唯一能跑通真实模型训练（含 Unsloth QLoRA）的路径。
 
 ## 和已有结论的关系
 
@@ -199,10 +282,18 @@ PyTorch 连设备都枚举不到）——**这个判断随着上面的修复已�
 
 - 只在这一块 8GB gfx1102 eGPU 上测过，没有裸机 Linux 或其他 RDNA3
   型号的对照
-- WSL2/ROCm 训练测试全部是玩具级/合成数据的 MLP，**没有测过真实的
-  transformer 模型微调**（下一步是 Unsloth 或裸手写一个小 transformer）
-- 没有做正式的 DirectML vs ROCm/WSL2 训练吞吐对照，上面给的计时数字
-  仅供参考，不构成结论
-- `torch-directml` 的算子覆盖缺口只确认了 `aten::lerp.Scalar_out` 这一个，
-  没有做穷举式的算子覆盖率扫描
-- Unsloth AMD 支持完全没测，是全文档最大的空白和下一轮候选
+- WSL2/ROCm 训练已经验证了合成 MLP + 真实 Unsloth QLoRA 微调，但 Unsloth
+  测试只跑了 1B 模型、20 step、玩具级数据集——没有测过更大模型（比如
+  AMD 自己给的 8B QLoRA 目标）、更长训练、真实数据集上的效果
+- `torch-directml` 的 `masked_fill` 崩溃只在这一个模型（Llama-3.2-1B）
+  这一个 transformers 版本（4.49.0）上复现过，没有测试其他模型架构
+  或其他 transformers 版本是否也踩中同一个坑，也没有去查这是不是
+  torch-directml 或 transformers 已知的 GitHub issue（没搜）
+- `torch-directml` 的算子覆盖缺口目前确认了两个（`aten::lerp.Scalar_out`
+  静默回退 + `masked_fill` 崩溃），没有做穷举式的算子覆盖率扫描
+- 没有追查 DirectML `masked_fill` 崩溃的底层根因（是不是 fill 值转换成
+  `uint8_t` 的某个内部实现分支，为什么会走到这个类型转换）——只做到
+  "确认可复现、排除精度和注意力实现两个变量"这一层
+- Unsloth 环境里 `pip install unsloth[amd]` 会静默换掉 ROCm torch 这件事，
+  只在这一次安装上验证过，没有确认是否所有 unsloth 版本/torch 版本
+  组合都会触发同样的行为
