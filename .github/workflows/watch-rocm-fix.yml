@@ -1,0 +1,118 @@
+name: watch-rocm-fix
+
+# 每周查一次 lemonade 是否发了新版本，以及 #2722（ROCm 打包 bug）是否被关闭。
+# 有变化就开 issue 提醒重测 —— 本仓库最核心的结论「Windows 上 ROCm 装不上」
+# 一旦上游修好就会失效，不该等到有人来指出才发现。
+#
+# 只读操作 + 开 issue，不改任何数据。
+
+on:
+  schedule:
+    # 每周一 03:00 UTC。cron 在 GitHub 上不保证准时，允许漂移几小时。
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check upstream state
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # 本仓库结论所基于的版本与 issue 状态
+          KNOWN_VERSION="11.5.0"
+          ISSUE=2722
+
+          LATEST=$(gh release view --repo lemonade-sdk/lemonade \
+                     --json tagName --jq .tagName 2>/dev/null || echo "")
+          STATE=$(gh issue view "$ISSUE" --repo lemonade-sdk/lemonade \
+                    --json state --jq .state 2>/dev/null || echo "")
+
+          echo "latest_release=$LATEST"
+          echo "issue_state=$STATE"
+
+          CHANGED=0
+          REASONS=""
+
+          # 版本号里可能带 v 前缀，去掉再比
+          NORM="${LATEST#v}"
+          if [ -n "$NORM" ] && [ "$NORM" != "$KNOWN_VERSION" ]; then
+            CHANGED=1
+            REASONS="${REASONS}- lemonade 发布了新版本: \`$LATEST\`（本仓库结论基于 $KNOWN_VERSION）\n"
+          fi
+          if [ "$STATE" = "CLOSED" ]; then
+            CHANGED=1
+            REASONS="${REASONS}- lemonade-sdk#$ISSUE 已关闭 —— ROCm 打包 bug 可能已修\n"
+          fi
+
+          {
+            echo "changed=$CHANGED"
+            echo "latest=$LATEST"
+            echo "state=$STATE"
+            echo "reasons<<EOF"
+            printf '%b' "$REASONS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # 避免每周重复开同一个 issue
+      - name: Look for an existing open reminder
+        id: existing
+        if: steps.check.outputs.changed == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+                --label rocm-watch --state open --json number --jq 'length')
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+
+      - name: Open reminder issue
+        if: steps.check.outputs.changed == '1' && steps.existing.outputs.count == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create rocm-watch --repo "$GITHUB_REPOSITORY" \
+            --description "上游 ROCm 状态变化，需重测" --color 0E8A16 2>/dev/null || true
+
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --label rocm-watch \
+            --title "上游状态有变，需重跑 ROCm 回归检查" \
+            --body "$(cat <<EOF
+          自动检测到上游变化：
+
+          ${{ steps.check.outputs.reasons }}
+
+          当前观测：
+          - lemonade 最新发布: \`${{ steps.check.outputs.latest }}\`
+          - lemonade-sdk#2722 状态: \`${{ steps.check.outputs.state }}\`
+
+          ## 需要重测什么
+
+          本仓库最核心的结论是「Windows 上 \`sd-cpp:rocm\` 装不上」。
+          上游一旦修好，\`docs/vulkan-first.md\` 和
+          \`docs/benchmark.md\` 的第一节都需要改。
+
+          按 \`docs/benchmark.md\` 末尾的回归清单跑：
+
+          1. \`lemonade backends install sd-cpp:rocm\` 是否仍报 TheRock 解压失败
+          2. 512² 热态出图是否仍约 2.47s（Vulkan 基线）
+          3. 分辨率天花板是否仍卡在 2816²
+          4. 8B 模型 TPS 是否仍约 33–34
+          5. 若 ROCm 可用，重跑全部表格并与 Vulkan 对比
+
+          注意每个配置前重启服务，否则数据不可比。
+
+          ---
+          由 \`.github/workflows/watch-rocm-fix.yml\` 自动创建。
+          处理完请关闭，否则下次检测到变化时不会重复提醒。
+          EOF
+          )"

@@ -31,13 +31,26 @@
 
 ## 跑你自己的基准（欢迎提交数据）
 
-`collect.ps1` 会自动探测显卡、每个用例前重启服务（消除状态残留），
-导出**不含任何路径或个人信息**的标准化 JSON：
+采集器会自动探测显卡、每个用例前重启服务（消除状态残留），
+导出**不含任何路径或个人信息**的标准化 JSON。
+
+**Linux 或跨平台**（推荐，只需 Python 3.10+，无第三方依赖）：
+
+```bash
+python scripts/collect.py --quick                    # 最小集，约 2 分钟
+python scripts/collect.py --note "RX 7900 XTX desktop"
+```
+
+**Windows**（PowerShell 版，功能等价）：
 
 ```powershell
-.\scripts\collect.ps1 -Quick              # 最小集，约 2 分钟
-.\scripts\collect.ps1 -Note "RX 7900 XTX" # 完整套件
+.\scripts\collect.ps1 -Quick
+.\scripts\collect.ps1 -Note "RX 7900 XTX"
 ```
+
+Linux 侧的显存数据来自 `amdgpu` 的 sysfs 节点
+（`/sys/class/drm/card*/device/mem_info_vram_used`），不依赖 `rocm-smi`——
+后者在很多发行版上没装。
 
 **如果你有 AMD 显卡，跑一下并把 JSON 贴到 issue 里。**
 数据格式与聚合约定见 [docs/schema.md](docs/schema.md)。
@@ -68,12 +81,17 @@
 
 ## 脚本
 
-| 脚本 | 用途 |
-|---|---|
-| `restore-config.ps1` | 一键恢复最优配置，`-Verify` 顺带冒烟 |
-| `quick-image.ps1` | 512+超分快速出图，支持批量与多模型 |
-| `collect.ps1` | 标准化基准采集，导出可跨机对比的 JSON |
-| `health-log.ps1` | 长期稳定性监控，记录 CSV 并对退化告警 |
+| 脚本 | 平台 | 用途 |
+|---|---|---|
+| `collect.py` | 全平台 | 标准化基准采集，导出可跨机对比的 JSON |
+| `collect.ps1` | Windows | 同上，PowerShell 版 |
+| `validate_submission.py` | 全平台 | 校验提交数据的 schema 与隐私，CI 也跑这个 |
+| `quick-image.ps1` | Windows | 512+超分快速出图，支持批量、多模型、断点续跑 |
+| `restore-config.ps1` | Windows | 一键恢复最优配置，`-Verify` 顺带冒烟 |
+| `health-log.ps1` | Windows | 长期稳定性监控，记录 CSV 并对退化告警 |
+
+批量出图会写 `_manifest.json` 记录进度。中途 Ctrl+C 或失败后
+**再跑一次同样的命令即可只补未完成的那些**（`-Force` 强制全部重跑）。
 
 ## 8GB 卡的推荐配置
 

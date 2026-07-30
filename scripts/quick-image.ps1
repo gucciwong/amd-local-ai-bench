@@ -45,6 +45,11 @@ param(
   # 默认会卸载：实测两个进程争 8GB 显存会让 SDXL 从 24s 劣化到 825s（34 倍）
   [switch]$KeepResident,
 
+  # 批量模式：忽略已有进度，强制全部重跑
+  [Parameter(ParameterSetName = 'Batch')]
+  [Parameter(ParameterSetName = 'File')]
+  [switch]$Force,
+
   # 基础生成尺寸。512 是 SD-Turbo 的训练分辨率，速度/质量最划算。
   # 用 -Model sdxl 时建议 1024（SDXL 的原生分辨率）
   [int]$Base = 512,
@@ -192,22 +197,77 @@ if ($OutDir -eq "") {
 }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
+# 断点续跑用的进度清单。批量 20 张要 8 分钟，中途 Ctrl+C 或失败
+# 不该让已完成的白跑。文件名按 prompt 内容的哈希取，不按序号——
+# 否则改动 prompt 列表的顺序会让续跑张冠李戴。
+$manifestPath = Join-Path $OutDir "_manifest.json"
+$done = @{}
+if ((Test-Path $manifestPath) -and -not $Force) {
+  try {
+    $loaded = Get-Content $manifestPath -Raw | ConvertFrom-Json
+    foreach ($e in $loaded.entries) {
+      # 只认文件真的还在的条目，避免手动删图后仍被跳过
+      if (Test-Path (Join-Path $OutDir $e.file)) { $done[$e.key] = $e.file }
+    }
+    if ($done.Count -gt 0) {
+      Write-Host ("续跑：已完成 {0} 张，将跳过（-Force 可强制重跑全部）" -f $done.Count) -ForegroundColor DarkGray
+    }
+  }
+  catch {
+    Write-Warning "进度清单读取失败，本次从头开始：$($_.Exception.Message)"
+  }
+}
+
+function Get-PromptKey {
+  param([string]$Text)
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try {
+    $bytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes("$Base|$Steps|$Model|$Anime|$NoUpscale|$Text"))
+    return ([BitConverter]::ToString($bytes) -replace '-').Substring(0, 12).ToLower()
+  }
+  finally { $sha.Dispose() }
+}
+
 $n = 0
 $failed = 0
+$skipped = 0
 $totalSec = 0.0
+$entries = [Collections.ArrayList]::new()
+
 foreach ($p in $list) {
   $n++
-  $name = "{0:d3}.png" -f $n
+  $key = Get-PromptKey -Text $p
+
+  if ($done.ContainsKey($key)) {
+    $skipped++
+    [void]$entries.Add([PSCustomObject]@{ key = $key; file = $done[$key]; prompt = $p })
+    Write-Host ("[{0}/{1}] 跳过（已完成）  {2}" -f $n, $list.Count, $done[$key]) -ForegroundColor DarkGray
+    continue
+  }
+
+  $name = "{0:d3}-{1}.png" -f $n, $key
   $dest = Join-Path $OutDir $name
   try {
     $r = New-Image -Text $p -Dest $dest
     $totalSec += $r.total
+    [void]$entries.Add([PSCustomObject]@{ key = $key; file = $name; prompt = $p })
     Write-Host ("[{0}/{1}] {2:N1}s  {3}  {4}" -f $n, $list.Count, $r.total, $name, $p)
   }
   catch {
     $failed++
     Write-Warning ("[{0}/{1}] 失败: {2}" -f $n, $list.Count, $_.Exception.Message)
   }
+  finally {
+    # 每张之后立刻落盘。放在 finally 里，Ctrl+C 也能保住进度。
+    @{ base = $Base; steps = $Steps; model = $Model; entries = $entries } |
+      ConvertTo-Json -Depth 4 | Set-Content $manifestPath -Encoding utf8
+  }
 }
-Write-Host ("批量完成: {0} 张成功, {1} 张失败, 合计 {2:N1}s (平均 {3:N1}s/张)  ->  {4}" -f `
-  ($n - $failed), $failed, $totalSec, $(if ($n - $failed -gt 0) { $totalSec / ($n - $failed) } else { 0 }), $OutDir)
+
+$made = $n - $failed - $skipped
+$avg = if ($made -gt 0) { $totalSec / $made } else { 0 }
+Write-Host ("批量完成: 新生成 {0} 张, 跳过 {1} 张, 失败 {2} 张, 本次 {3:N1}s (平均 {4:N1}s/张)  ->  {5}" -f `
+  $made, $skipped, $failed, $totalSec, $avg, $OutDir)
+if ($failed -gt 0) {
+  Write-Host "再跑一次同样的命令即可只重试失败的那些。" -ForegroundColor DarkGray
+}
