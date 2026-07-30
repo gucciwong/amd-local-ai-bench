@@ -13,7 +13,7 @@
 | "AMD 要跑 AI 得先搞定 ROCm" | ROCm 在 **Windows 原生**装不上（上游打包 bug）。Vulkan 9.6 秒装好，8B 模型 33 tok/s |
 | "开 `enable_dgpu_gtt` 让独显借系统内存" | **慢 58 倍**（2.73s → 158s），且并不能提高分辨率上限 |
 | "双显卡应该分工协作" | 拆分单个扩散任务在**所有场景都是负优化**（最多慢 3.6 倍） |
-| "反正 ROCm 在这块卡上就是不行" | **不对**——WSL2 上 ROCm/HIP 真实可用（36.4 vs Vulkan 33-34 tok/s），只是 Windows 原生这条路坏了，配方见 [docs/rocm-on-wsl2.md](docs/rocm-on-wsl2.md) |
+| "反正 ROCm 在这块卡上就是不行" | **只说对了一半**——WSL2 上 ROCm/HIP 真实可用：LLM 打平甚至略快 Vulkan（36.4 vs 33-34 tok/s），但**出图反而慢约 3-4 倍**（10.1s vs Vulkan 2.47s）。Windows 原生这条路依然是坏的，两个方向的实测和坑都在 [docs/rocm-on-wsl2.md](docs/rocm-on-wsl2.md) |
 
 ## 快速开始
 
