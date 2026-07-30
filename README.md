@@ -6,7 +6,7 @@
 **包括那些被推翻的结论。** 网上很少有人发表失败的实验，
 但恰恰是它们最省别人的时间。
 
-## 四个反直觉的实测结论
+## 反直觉的实测结论
 
 | 说法 | 实测 |
 |---|---|
@@ -14,6 +14,8 @@
 | "开 `enable_dgpu_gtt` 让独显借系统内存" | **慢 58 倍**（2.73s → 158s），且并不能提高分辨率上限 |
 | "双显卡应该分工协作" | 拆分单个扩散任务在**所有场景都是负优化**（最多慢 3.6 倍） |
 | "反正 ROCm 在这块卡上就是不行" | **只说对了一半**——WSL2 上 ROCm/HIP 真实可用：LLM 打平甚至略快 Vulkan（36.4 vs 33-34 tok/s），但**出图反而慢约 3-4 倍**（10.1s vs Vulkan 2.47s）。Windows 原生这条路依然是坏的，两个方向的实测和坑都在 [docs/rocm-on-wsl2.md](docs/rocm-on-wsl2.md) |
+| "WSL2 上 ROCm 能推理，训练应该也没问题" | **不对**——`torch.cuda.is_available()` 直接返回 `False`，根因是 WSL2 压根没有 `/dev/kfd`/`/sys/class/kfd`（只有 `/dev/dxg`），PyTorch 的 HIP 运行时枚举设备这一步就过不去，跟推理引擎能跑是两回事，见 [docs/training-methodologies.md](docs/training-methodologies.md) |
+| 网上说 Vulkan flash-attention 在 AMD 上会回退 CPU、慢 60-97% | 这块卡上**没有重现**：短上下文两者打平，长上下文（4096）FA 只慢约 9%，量级完全不同——不要不测就把外部结论抄进自己的配置里 |
 
 ## 快速开始
 
@@ -76,9 +78,11 @@ Linux 侧的显存数据来自 `amdgpu` 的 sysfs 节点
 
 | 文件 | 内容 |
 |---|---|
-| [docs/benchmark.md](docs/benchmark.md) | 完整实测数据，13 节，含负面结果与方法学教训 |
+| [docs/benchmark.md](docs/benchmark.md) | 完整实测数据，14 节，含负面结果与方法学教训 |
 | [docs/vulkan-first.md](docs/vulkan-first.md) | 「Vulkan-first 而非 ROCm-first」的论证 |
 | [docs/issue-2722-repro.md](docs/issue-2722-repro.md) | 给上游 ROCm bug 的复现报告 |
+| [docs/rocm-on-wsl2.md](docs/rocm-on-wsl2.md) | WSL2 上 ROCm/HIP 推理实测（LLM+出图）、rocprof 追查、装机踩坑全记录 |
+| [docs/training-methodologies.md](docs/training-methodologies.md) | 训练/微调方法论盘点：PyTorch-ROCm 在 WSL2 上的硬阻塞根因，及 Unsloth/DirectML 等待测项 |
 
 ## 脚本
 
