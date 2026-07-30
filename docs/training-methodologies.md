@@ -45,6 +45,20 @@ W ... agent.cpp:608] sysfs nodes path '/sys/class/kfd/kfd/topology/nodes' does n
 False
 ```
 
+`is_available()` 返回 `False` 之后，真去尝试用 GPU 会拿到什么错误？
+不猜，直接试：
+
+```python
+torch.randn(4, 4).to('cuda')
+```
+
+```
+RuntimeError: No CUDA GPUs are available
+```
+
+跟检测阶段的报错是一致的——不是某个 op 不支持才失败，是最开始那一步就
+没有设备可用，所以任何试图用 GPU 的代码都会在同一个地方倒下。
+
 直接查文件系统，坐实根因：
 
 ```bash
