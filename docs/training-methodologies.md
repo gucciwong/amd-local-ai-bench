@@ -22,8 +22,8 @@
 | 方法 | 状态 | 置信度 |
 |---|---|---|
 | PyTorch-ROCm 在 **WSL2** 上训练 | ✅ **能跑**——删掉 pip 轮子自带的 `libhsa-runtime64.so`，改用系统 ROCm 的 WSL 感知版本后，`torch.cuda.is_available()` 返回 `True`，玩具 MLP + 4096维 MLP + fp16 autocast + 真实 transformer LoRA 训练全部正确收敛 | 🟢 四个规模全部验证，含 GPU vs CPU 结果比对 |
-| **Unsloth 官方 AMD 支持（RDNA3 QLoRA）** | ✅ **实测成功，全网第一份 gfx1102 数据**——Llama-3.2-1B 4-bit QLoRA，20 step，loss 4.84→0.84（含中间噪声但整体下降），11.3M/1.25B 可训练参数（0.90%），峰值显存 1.33GB | 🟢 完整训练循环跑通，Unsloth 自己的横幅确认识别到 `AMD Radeon RX 7600M XT`+ROCm 7.2 |
-| `torch-directml`（原生 Windows） | ⚠️ **对合成 MLP 能跑，对真实 transformer 模型崩溃**——`masked_fill` 在准备因果注意力掩码时报 `RuntimeError: value cannot be converted to type uint8_t without overflow`，fp16/fp32/eager 注意力实现都试过，同一个错误 | 🟢 合成 MLP 训练✅已验证；🟢 真实模型崩溃也已复现三次，非偶发 |
+| **Unsloth 官方 AMD 支持（RDNA3 QLoRA）** | ✅ **实测成功，全网第一份 gfx1102 数据**——1B/4B/8B 三个规模全部验证，峰值显存 1.33GB/3.89GB/7.83GB，跟 AMD 自己给的"≈4GB/≈8GB贴上限"估算几乎逐位对上，8B 那次只剩约 345MB 余量、没有 OOM | 🟢 三个规模独立验证，loss 全部下降，Unsloth 横幅确认识别到 `AMD Radeon RX 7600M XT`+ROCm 7.2 |
+| `torch-directml`（原生 Windows） | ⚠️ **对合成 MLP 能跑，对真实 transformer 模型崩溃**——`masked_fill` 在准备因果注意力掩码时报 `RuntimeError: value cannot be converted to type uint8_t without overflow`，fp16/fp32/eager 注意力实现都试过，同一个错误。已确认是 `microsoft/DirectML#702`，官方标记 `not_planned`，不会修 | 🟢 合成 MLP 训练✅已验证；🟢 真实模型崩溃复现三次+对上已知 issue，非偶发 |
 | Microsoft Olive / ONNX Runtime | 未测，且据调研主要面向 NPU 不是这块独显 | 🔴 转述自调研 |
 | 原生 Windows ROCm（TheRock 之外，AMD 2025 新推的统一安装包） | 不适用 | 🔴 转述自调研——AMD 官方 Windows 支持矩阵明确只列 `gfx1100/1101/1200/1201`，**没有 gfx1102**，且即使是受支持的卡，原生 Windows 也只做推理，训练仍需 WSL2（但 WSL2 本身现在确认可行，见上） |
 
@@ -206,6 +206,43 @@ Trainable parameters = 11,272,192 of 1,247,086,592 (0.90% trained)
   Enable it with TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` —— 一个
   具体的、没试过的加速开关，留给下一轮。
 
+### 往上推：直接验证 AMD 自己给的显存量级，三个规模全部命中
+
+前面提到 AMD 自己在 `amd/gaia#667` 给的目标是"Qwen3-4B QLoRA ≈4GB、
+Qwen3-8B QLoRA ≈8GB（贴着上限）"——这些数字之前只是转述，现在补测了
+Qwen3-4B 和 Qwen3-8B，直接在这块真实的 8GB（准确说 8176 MiB）卡上验证：
+
+| 模型 | 可训练参数 | 峰值显存（训练中） | 20 step 均耗时 | loss 首→尾 |
+|---|---|---|---|---|
+| Llama-3.2-1B | 11.3M / 1.25B（0.90%） | **1.33 GB** | 1238.7 ms/step | 4.84 → 0.84 |
+| Qwen3-4B | 33.0M / 4.06B（0.81%） | **3.89 GB** | 1946.7 ms/step | 6.66 → 0.96 |
+| Qwen3-8B | 43.6M / 8.23B（0.53%） | **7.83 GB** | 3186.2 ms/step | 5.29 → 1.00 |
+
+**Qwen3-4B 的 3.89GB 和 Qwen3-8B 的 7.83GB，跟 AMD 自己给的"≈4GB"
+"≈8GB（贴着上限）"几乎逐位对上**——8B 那次，卡总共 8176 MiB，训练峰值
+用掉 7832 MiB，**只剩约 345MB 余量**，是真的"贴着上限"，不是夸张说法，
+而且**确实没有 OOM，训练完整跑完**。这是本仓库第一次把 AMD 自己给的
+估算数字换成本机实测数字去对照，而且三个规模全部吻合，不是巧合命中
+一次。
+
+（表里的 ms/step 是 20 step 的平均值，包含首步 Triton kernel JIT 编译
+的固定开销——模型越大摊薄效果越不明显，所以不是纯稳态吞吐数字，
+但三个模型用的是同一套摊薄方式，横向比较仍然有意义。）
+
+**另一个真实的小插曲**：Qwen3-8B 首次尝试时，Unsloth 想预下载
+`unsloth/qwen3-8b-unsloth-bnb-4bit`（预量化版）失败：
+
+```
+Unsloth: Could not pre-download unsloth/qwen3-8b-unsloth-bnb-4bit
+(RuntimeError: ConnectError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate
+verify failed: Hostname mismatch, certificate is not valid for
+'huggingface.co'); continuing with the normal load.
+```
+
+Unsloth **自己捕获了这个错误并优雅回退**，改成下载未量化版本自己动态
+量化（体积更大，下载耗时从预期的几分钟变成约 11.5 分钟），最终还是
+成功跑完了——没有崩，只是慢一点，值得记录但不算阻塞。
+
 ## 严谨的跨后端对照：撞上一个真实的 DirectML bug
 
 本来想做一个"真正公平"的 DirectML vs WSL2/ROCm 训练吞吐对照——不用
@@ -246,12 +283,31 @@ RuntimeError: value cannot be converted to type uint8_t without overflow
 一节测过的合成 MLP 能在 DirectML 上训练不矛盾，只是**真实 transformer
 模型用到的这个具体算子模式，DirectML 目前跑不通**。
 
+**查证：这是一个已知问题，而且官方已经关闭不修了。** 搜到
+[microsoft/DirectML#702](https://github.com/microsoft/DirectML/issues/702)——
+一模一样的报错文本、一模一样的代码路径
+（`_prepare_4d_causal_attention_mask_with_cache_position` 里的
+`masked_fill`），原报告用的是 GPT-Neo（不是 Llama，但两个模型在
+`transformers` 里的掩码准备函数结构几乎一样），显卡是 RX 6700 XT
+（不是这块 gfx1102，但同一个 DirectML 后端）。**状态：已关闭，
+`not_planned`**——DirectML 维护者原话："DirectML is in maintenance
+mode. We will not be able to look into this issue, unfortunately."
+[Gemma-3-1b-it 的 HF 讨论区](https://huggingface.co/google/gemma-3-1b-it/discussions/19)
+也有人在 RX 7800 XT 上报了同一个错误，进一步印证这不是这块卡特有的。
+
+原 issue 里作者验证过的绕过方法：把 `masked_fill` 换成等价的
+`torch.where` 调用——同样的逻辑，但避开了 DirectML 那个处理极端填充值
+出问题的内部实现。**没有官方修复，也不会有**：这意味着任何用到这个
+掩码模式的模型（不只是 Llama，`transformers` 里每个模型的掩码准备函数
+都是从同一套模板复制出来的），在 `torch-directml` 上训练都会撞到
+同一堵墙，除非用户自己手动 patch 对应模型的 `modeling_*.py`。
+
 **这意味着本轮没能拿到一个"两边都跑完、比时间"的干净数字**——但这
 本身就是答案：与其说"DirectML 训练能跑，只是不知道多快"，不如说
-"DirectML 现在连这个最常见的 Llama 因果掩码模式都跑不过去"，这是一个
-比吞吐数字更重要的发现。没有进一步去 patch `transformers` 的掩码实现
-或深挖 DirectML 内核代码——那已经超出"做一次对照测试"的范围，留作
-边界记录。
+"DirectML 现在连这个最常见的 Llama 因果掩码模式都跑不过去，而且官方
+不打算修"，这是一个比吞吐数字更重要的发现。没有自己去 patch
+`transformers` 的掩码实现验证 `torch.where` 绕过是否真的有效——
+那已经超出"做一次对照测试"的范围，留作边界记录。
 
 ## 两条路怎么选
 
@@ -282,13 +338,17 @@ RuntimeError: value cannot be converted to type uint8_t without overflow
 
 - 只在这一块 8GB gfx1102 eGPU 上测过，没有裸机 Linux 或其他 RDNA3
   型号的对照
-- WSL2/ROCm 训练已经验证了合成 MLP + 真实 Unsloth QLoRA 微调，但 Unsloth
-  测试只跑了 1B 模型、20 step、玩具级数据集——没有测过更大模型（比如
-  AMD 自己给的 8B QLoRA 目标）、更长训练、真实数据集上的效果
-- `torch-directml` 的 `masked_fill` 崩溃只在这一个模型（Llama-3.2-1B）
-  这一个 transformers 版本（4.49.0）上复现过，没有测试其他模型架构
-  或其他 transformers 版本是否也踩中同一个坑，也没有去查这是不是
-  torch-directml 或 transformers 已知的 GitHub issue（没搜）
+- WSL2/ROCm 训练已经验证了合成 MLP + 真实 Unsloth QLoRA 微调，三个模型
+  规模（1B/4B/8B）都验证了 AMD 自己给的显存量级，但每个规模都只跑了
+  20 step、玩具级合成数据集——没有测过真实数据集上更长训练的效果，
+  也没有测过训练完的模型实际推理质量（只验证了 loss 下降，没验证
+  微调后模型输出是否真的学到了东西）
+- `torch-directml` 的 `masked_fill` 崩溃只在 Llama-3.2-1B + transformers
+  4.49.0 上直接复现过，但已确认是 `microsoft/DirectML#702`（GPT-Neo）+
+  Gemma-3-1b-it 讨论区（另一张卡）同一个问题的第三次独立复现，说明
+  这是 `transformers` 通用掩码模板 + DirectML 后端的组合问题，不是
+  Llama 或这块卡特有的——但没有在其他模型架构上亲自复现，也没有亲自
+  验证 issue 里给出的 `torch.where` 绕过方法是否有效
 - `torch-directml` 的算子覆盖缺口目前确认了两个（`aten::lerp.Scalar_out`
   静默回退 + `masked_fill` 崩溃），没有做穷举式的算子覆盖率扫描
 - 没有追查 DirectML `masked_fill` 崩溃的底层根因（是不是 fill 值转换成
