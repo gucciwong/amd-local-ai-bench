@@ -16,7 +16,7 @@
 | "反正 ROCm 在这块卡上就是不行" | **只说对了一半**——WSL2 上 ROCm/HIP 真实可用：LLM 打平甚至略快 Vulkan（36.4 vs 33-34 tok/s），但**出图反而慢约 3-4 倍**（10.1s vs Vulkan 2.47s）。Windows 原生这条路依然是坏的，两个方向的实测和坑都在 [docs/rocm-on-wsl2.md](docs/rocm-on-wsl2.md) |
 | "WSL2 上 ROCm 能训练吗" | **能，但要修一个坑**：pip 装的 torch wheel 自带一份不认 WSL2 的 `libhsa-runtime64.so`，抢在系统那份（已支持 WSL 的 ROCDXG 桥接）前面被加载，删掉它就通——`torch.cuda.is_available()` 变 `True`。**这条结论我们自己也改过一次**：一开始误判成"硬阻塞、大概率无解"并据此发过一次修正，后来才找到真正的修复 |
 | 网上说 Vulkan flash-attention 在 AMD 上会回退 CPU、慢 60-97% | 这块卡上**没有重现**：短上下文两者打平，长上下文（4096）FA 只慢约 9%，量级完全不同——不要不测就把外部结论抄进自己的配置里 |
-| "DirectML 训练更省事，应该也更能打" | 修好的 WSL2/ROCm 上实测跑通了 **Unsloth 官方 AMD QLoRA 支持**（1B/4B/8B 三个规模，全网第一份 gfx1102 数据，还专门验证了模型真的学到了编造的新事实，不只是 loss 数字）；反倒是"更省事"的 `torch-directml` 在真实 transformer 模型上直接崩溃（`masked_fill` 报 `uint8_t overflow`，已确认是官方标记 `not_planned` 的已知 issue）。**亲自试了社区给的绕过方法**：崩溃是消失了，但训练变成 loss 恒为 `nan`——换了个更隐蔽的失败方式，过程见 [docs/training-methodologies.md](docs/training-methodologies.md) |
+| "DirectML 训练更省事，应该也更能打" | 修好的 WSL2/ROCm 上实测跑通了 **Unsloth 官方 AMD QLoRA 支持**（1B/4B/8B 三个规模，全网第一份 gfx1102 数据，还专门验证了模型真的学到了编造的新事实，不只是 loss 数字）；反倒是"更省事"的 `torch-directml` 在真实 transformer 模型上直接崩溃。**追到了比官方 issue 更深的根因**：DirectML 的乘法算子不遵守 `float *= bool` 的类型提升规则，会把张量静默腐化成 bool dtype——这才是崩溃和后来 NaN 的共同源头。修一行代码（乘法前转 dtype）就完全解决，比 `microsoft/DirectML#702` 官方给的绕过法更早、更准、更简单，过程见 [docs/training-methodologies.md](docs/training-methodologies.md) |
 
 ## 快速开始
 
@@ -83,7 +83,7 @@ Linux 侧的显存数据来自 `amdgpu` 的 sysfs 节点
 | [docs/vulkan-first.md](docs/vulkan-first.md) | 「Vulkan-first 而非 ROCm-first」的论证 |
 | [docs/issue-2722-repro.md](docs/issue-2722-repro.md) | 给上游 ROCm bug 的复现报告 |
 | [docs/rocm-on-wsl2.md](docs/rocm-on-wsl2.md) | WSL2 上 ROCm/HIP 推理实测（LLM+出图）、rocprof 追查、装机踩坑全记录 |
-| [docs/training-methodologies.md](docs/training-methodologies.md) | 训练/微调方法论盘点：PyTorch-ROCm 在 WSL2 上的硬阻塞根因，及 Unsloth/DirectML 等待测项 |
+| [docs/training-methodologies.md](docs/training-methodologies.md) | 训练/微调方法论盘点：WSL2 PyTorch-ROCm 修复+Unsloth 三规模验证、DirectML 因果掩码类型提升 bug 全链路根因追查 |
 
 ## 脚本
 
@@ -95,6 +95,7 @@ Linux 侧的显存数据来自 `amdgpu` 的 sysfs 节点
 | `quick-image.ps1` | Windows | 512+超分快速出图，支持批量、多模型、断点续跑 |
 | `restore-config.ps1` | Windows | 一键恢复最优配置，`-Verify` 顺带冒烟 |
 | `health-log.ps1` | Windows | 长期稳定性监控，记录 CSV 并对退化告警 |
+| `verify_finetune_learned.py` | 全平台（CUDA/ROCm/DirectML/CPU） | 验证一次微调是不是真学到了新东西，不只是 loss 下降；用编造事实排除"模型本来就会"的假阳性 |
 
 批量出图会写 `_manifest.json` 记录进度。中途 Ctrl+C 或失败后
 **再跑一次同样的命令即可只补未完成的那些**（`-Force` 强制全部重跑）。

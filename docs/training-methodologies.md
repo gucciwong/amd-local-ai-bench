@@ -7,8 +7,9 @@
 微调后的模型是不是真的学到了新东西（不是只看 loss 数字）——全网目前
 找不到第二份 gfx1102 数据。原生 Windows 上的 `torch-directml` 对合成
 负载能训练，但对真实 transformer 模型撞上一个已知、官方不打算修的崩溃；
-亲自验证了社区给的绕过方法，发现它只是把崩溃换成了静默的 `nan` loss，
-没有真正解决问题。
+追到底发现真正根因比社区给出的说法更深一层——**DirectML 的乘法算子
+不遵守 `float *= bool` 的标准类型提升规则，会把浮点张量静默腐化成
+bool dtype**，且验证了一个比社区绕过法更简单、更彻底的修复。
 
 > 置信度标注延续 [benchmark.md](benchmark.md) 的规则：🟢 已对照/已复现，
 > 🟡 单轮，🔴 未验证/转述自调研。
@@ -27,7 +28,7 @@
 |---|---|---|
 | PyTorch-ROCm 在 **WSL2** 上训练 | ✅ **能跑**——删掉 pip 轮子自带的 `libhsa-runtime64.so`，改用系统 ROCm 的 WSL 感知版本后，`torch.cuda.is_available()` 返回 `True`，玩具 MLP + 4096维 MLP + fp16 autocast + 真实 transformer LoRA 训练全部正确收敛 | 🟢 四个规模全部验证，含 GPU vs CPU 结果比对 |
 | **Unsloth 官方 AMD 支持（RDNA3 QLoRA）** | ✅ **实测成功，全网第一份 gfx1102 数据**——1B/4B/8B 三个规模全部验证，峰值显存 1.33GB/3.89GB/7.83GB，跟 AMD 自己给的"≈4GB/≈8GB贴上限"估算几乎逐位对上，8B 那次只剩约 345MB 余量、没有 OOM。**专门验证了"真学到东西"而不只是 loss 下降**：用模型不可能已知的编造事实微调，微调前 4/4 答不出来，微调后 4/4 准确背出 | 🟢 三个规模+一次学习质量测试全部独立验证 |
-| `torch-directml`（原生 Windows） | ⚠️ **对合成 MLP 能跑，对真实 transformer 模型崩溃**——`masked_fill` 报 `RuntimeError: value cannot be converted to type uint8_t without overflow`，fp16/fp32/eager 都一样。已确认是 `microsoft/DirectML#702`，官方标记 `not_planned`。**亲自验证了社区给的 `torch.where` 绕过方法**：崩溃确实消失，但训练变成从第 0 步起 loss 恒为 `nan`——只是把崩溃换成了静默失败，没有真正修好 | 🟢 崩溃复现三次+对上已知 issue；🟢 绕过方法亲测：解决崩溃但暴露 NaN 问题 |
+| `torch-directml`（原生 Windows） | ⚠️➡️✅ **真正根因已定位并修复**——原始崩溃（`masked_fill` 报 `uint8_t overflow`）和社区绕过法（`torch.where`）留下的 NaN，根源都是同一处：`transformers` 原版代码 `causal_mask *= bool_tensor` 这个原地乘法，DirectML 不遵守标准类型提升规则，把 float 张量静默腐化成 bool。改成乘法前先把 bool 转成目标 dtype，**不用换 `masked_fill`，15 步干净收敛，loss 4.04→1.26，无崩溃无 NaN**——比 `microsoft/DirectML#702` 官方 issue 给出的绕过法更早、更准、更简单 | 🟢 逐模块插桩定位到具体模块+最小化隔离复现+验证修复三重锁定 |
 | Microsoft Olive / ONNX Runtime | 未测，且据调研主要面向 NPU 不是这块独显 | 🔴 转述自调研 |
 | 原生 Windows ROCm（TheRock 之外，AMD 2025 新推的统一安装包） | 不适用 | 🔴 转述自调研——AMD 官方 Windows 支持矩阵明确只列 `gfx1100/1101/1200/1201`，**没有 gfx1102**，且即使是受支持的卡，原生 Windows 也只做推理，训练仍需 WSL2（但 WSL2 本身现在确认可行，见上） |
 
@@ -294,6 +295,25 @@ loss 轨迹也同步佐证（`3.818 → 1.006 → 0.509 → 0.443 → 0.413 → 
 是"模型确实学会了它之前不可能知道的东西"**。这是本仓库第一次把"训练
 有没有真的起作用"这个问题从 loss 曲线升级成可验证的行为对照。
 
+### 这套方法打包成了可复用脚本
+
+`scripts/verify_finetune_learned.py`：裸 `transformers`+`peft`
+（不依赖 Unsloth——Unsloth 是 AMD/CUDA 专属，这个脚本要能跨 CUDA/ROCm/
+DirectML/CPU 跑），跑一遍微调前后的对比生成，自动判定每条编造事实
+是否被准确复述，退出码 0/1 对应全对/有遗漏，方便接进脚本或 CI：
+
+```bash
+python scripts/verify_finetune_learned.py
+python scripts/verify_finetune_learned.py --model unsloth/Llama-3.2-1B-Instruct --backend cuda
+python scripts/verify_finetune_learned.py --facts my_facts.json --steps 100 --out result.json
+```
+
+已经在 WSL2/ROCm 上重新跑通验证（跟前面的结果一致，4/4 全部学会，
+loss 5.74→0.35）；顺带修了一个脚本自己的坑——`apply_chat_template`
+在不同 transformers 版本下 `tokenize=True, return_tensors="pt"` 有时
+返回裸 tensor、有时返回 `BatchEncoding`，版本不对会在 `model.generate()`
+深处炸得很隐晦，改成先转纯文本再自己 tokenize，跨版本更稳。
+
 ## 严谨的跨后端对照：撞上一个真实的 DirectML bug
 
 本来想做一个"真正公平"的 DirectML vs WSL2/ROCm 训练吞吐对照——不用
@@ -375,19 +395,121 @@ step 9: loss=nan
 ```
 
 **换句话说，这个社区绕过方法只修好了"崩溃"这一个症状，没有修好
-"训练能不能真的算对"这个更深的问题。** `torch.where` 版本消除了那个
-会让程序直接停下来的报错，但背后大概率还有别的数值问题（比如某一行
-因为全被掩码掉、softmax 输入全是极端负值导致除零/NaN，这类问题在
-`masked_fill` 报错时根本不会执行到，换成 `torch.where` 才第一次暴露
-出来）——这某种程度上比原来的崩溃更麻烦：**崩溃至少是个明确的停止
-信号，NaN loss 如果不特意去检查，训练脚本会"正常跑完"却什么都没学到。**
+"训练能不能真的算对"这个更深的问题。**
 
-**这也解释了为什么这是官方 `not_planned`**：不是一个孤立的、修一行代码
-就能解决的 bug，而是 DirectML 后端在这类算子模式上有更根本的数值处理
-问题，`torch.where` 只是绕开了其中最外层、最容易触发崩溃的那一层。
-没有再往下追查 NaN 的具体根源（比如插桩打印 attention 中间张量），
-那已经是给 DirectML 本身修 bug 的量级了，超出"验证一个社区绕过方法
-是否有效"这次任务的范围。
+### 继续往下追——真正的根因比 masked_fill 更早、更底层
+
+上面这个 NaN 没有停在"留作边界记录"——追下去了，而且追到底了。
+
+**第一步：逐模块插桩，定位 NaN 第一次出现在哪。** 给模型每个子模块
+挂 forward hook，检查每个模块的输出有没有 NaN/Inf，跑一次单步
+forward+backward（跟之前产生 NaN 的完全相同的输入）：
+
+```
+*** FORWARD NaN/Inf at: base_model.model.model.layers.0.self_attn.o_proj.base_layer (Linear) ***
+```
+
+**第 0 层注意力的输出投影（`o_proj`）就已经是 NaN**——这是一个纯
+`Linear` 层，自己不会凭空产生 NaN，说明 NaN 是从它的输入（也就是
+attention 计算本身，`scaled_dot_product_attention` 的输出）带进来的。
+这指向一个经典模式：**某一行的注意力掩码整行都被填成极端负值，
+softmax 对这样的输入会算出 `0/0 = NaN`**。
+
+**第二步：查 `transformers` 自己是怎么防这个问题的。** 果然，
+`modeling_llama.py` 里在生成 SDPA 用的掩码后有一段专门防这个的调用：
+
+```python
+if (
+    self.config._attn_implementation == "sdpa"
+    and attention_mask is not None
+    and attention_mask.device.type in ["cuda", "xpu"]
+    and not output_attentions
+):
+    causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
+```
+
+`_unmask_unattended` 专门用来防"一整行都被掩码掉导致 softmax 出 NaN"
+这个问题（文档字符串直接引用了 `pytorch/pytorch#110213`）——**但触发
+条件写死了 `device.type in ["cuda", "xpu"]`**。查了一下 DirectML 的
+`device.type` 实际是什么：
+
+```python
+>>> torch.zeros(1, device=torch_directml.device()).device.type
+'privateuseone'
+```
+
+**`"privateuseone"` 不在这个白名单里**，所以这段专门防 NaN 的安全机制
+在 DirectML 上被直接跳过了——这才是 NaN 真正的第一层根因，跟
+`masked_fill` 还是 `torch.where`完全无关。
+
+**第三步：直接在补丁函数里补上这个调用，无条件调用 `_unmask_unattended`**——
+结果不是修好了，而是**在这个函数内部就先报错**：
+
+```
+ValueError: AttentionMaskConverter._unmask_unattended expects a float
+`expanded_mask`, got a BoolTensor.
+```
+
+`causal_mask` 在到达这一步之前，**类型已经变成了 `torch.bool`**，
+不是预期的 `float32`——这是第三层、也是最终最真实的根因。往回查
+`causal_mask` 是在哪一步被建出来的，问题出在这一行（原版 `transformers`
+代码，不是任何补丁）：
+
+```python
+causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
+```
+
+这是一个 `float_tensor *= bool_tensor` 的原地乘法。标准 PyTorch
+语义（CUDA/CPU）下，这个操作会把 bool 提升成 float 参与乘法，结果
+保持 float。**用最小化的隔离测试直接验证 DirectML 是不是这样**：
+
+```python
+x = torch.full((4,), -3.4e38, dtype=torch.float32, device=dev)
+x *= torch.tensor([True, False, True, False], device=dev)
+print(x.dtype)   # torch.bool  <- 应该是 float32
+```
+
+**确认了：DirectML 的乘法算子不遵守标准的类型提升规则**——不管是
+`in-place *=`、`.mul_()` 还是普通的 out-of-place `*`，只要参与乘法的
+一方是 bool tensor，**结果会被静默降级成 bool dtype**，浮点值（这里是
+`-3.4e38`）直接丢失，被 bool 掩码本身的 True/False 取代。这解释了
+之前的一切：
+- `causal_mask` 在最开始那次 `*=` 就已经被"腐化"成了 bool——这也是
+  原始 `masked_fill` 报 `uint8_t overflow` 的真正原因（对一个实际上
+  是 bool 类型的张量做极端浮点值填充）
+- 换成 `torch.where` 只是绕开了 `masked_fill` 这一个调用点，没有解决
+  `causal_mask` 本身已经被腐化这件事，所以 NaN 依然存在
+
+### 真正的修复：比社区给的绕过法更早、更简单
+
+修复非常小——在乘法之前，把 bool 比较结果显式转成目标 dtype：
+
+```python
+keep_mask = (torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)).to(dtype)
+causal_mask = causal_mask * keep_mask   # 而不是 causal_mask *= bool_tensor
+```
+
+**只做这一处修改，`masked_fill` 完全不用换成 `torch.where`**，重新
+跑训练：
+
+```
+step 0: loss=4.0396
+step 1: loss=3.6718
+...
+step 14: loss=1.2602
+```
+
+**15 步干净跑完，loss 平滑下降，没有崩溃，没有 NaN。** 这比
+`microsoft/DirectML#702` 里给出的绕过法（换成 `torch.where`）更早、
+更准、也更简单——那个绕过法解决的是下游症状（`masked_fill` 报错），
+这个修复解决的是上游根因（乘法类型提升错误），根治了包括 NaN 在内的
+所有下游问题。
+
+**这也是本轮"验证社区绕过方法"这个任务真正的收获**：没有停在
+"官方说 not_planned，所以问题到此为止"，而是继续往下追，最终追到了
+一个比社区讨论区里任何人给出的说法都更精确、更底层的根因，并且验证
+过这个更小的修复确实解决了全部问题（含 NaN），不是又一层"看起来修好
+了"的假象。
 
 **这意味着本轮没能拿到一个"两边都跑完、比时间"的干净数字**——但这
 本身就是答案：与其说"DirectML 训练能跑，只是不知道多快"，不如说
@@ -433,16 +555,17 @@ step 9: loss=nan
 - `torch-directml` 的 `masked_fill` 崩溃已确认是 `microsoft/DirectML#702`
   （GPT-Neo）+ Gemma-3-1b-it 讨论区（另一张卡）同一个问题的第三次独立
   复现，说明是 `transformers` 通用掩码模板 + DirectML 后端的组合问题，
-  不是 Llama 或这块卡特有的。**亲自验证了 issue 里给出的 `torch.where`
-  绕过方法**：确实消除了崩溃，但训练变成从第 0 步开始 loss 恒为
-  `nan`——绕过方法只解决了崩溃这一个症状，背后还有更深的数值问题没有
-  修，没有继续往下追查 NaN 的具体根源（那是给 DirectML 本身修 bug的
-  量级，超出这次"验证一个社区方案是否有效"的范围）
-- `torch-directml` 的算子覆盖缺口目前确认了两个（`aten::lerp.Scalar_out`
-  静默回退 + `masked_fill` 崩溃），没有做穷举式的算子覆盖率扫描
-- 没有追查 DirectML `masked_fill` 崩溃的底层根因（是不是 fill 值转换成
-  `uint8_t` 的某个内部实现分支，为什么会走到这个类型转换）——只做到
-  "确认可复现、排除精度和注意力实现两个变量"这一层
+  不是 Llama 或这块卡特有的。**追到底了**：真正根因是 DirectML 的乘法
+  算子不遵守 `float *= bool` 的标准类型提升规则（用最小化隔离测试确认，
+  in-place 和 out-of-place 都一样），验证过修复（乘法前把 bool 转成
+  目标 dtype）后 15 步干净收敛，无崩溃无 NaN——只在这一个模型
+  （Llama-3.2-1B）上验证过，没有测试这个类型提升 bug 是否也影响
+  其他会做 `float *= bool` 这类运算的场景（不只是因果掩码构造）
+- `torch-directml` 的算子覆盖缺口目前确认了两个：`aten::lerp.Scalar_out`
+  静默回退 CPU、乘法算子的类型提升 bug——没有做穷举式的算子覆盖率扫描，
+  不确定还有多少类似的类型提升问题没被撞到
+- 找到的这个类型提升根因，没有反馈回 `microsoft/DirectML#702` 或另开
+  issue——是否要公开报告是 owner 的决定，不是本轮任务范围
 - Unsloth 环境里 `pip install unsloth[amd]` 会静默换掉 ROCm torch 这件事，
   只在这一次安装上验证过，没有确认是否所有 unsloth 版本/torch 版本
   组合都会触发同样的行为
