@@ -2,9 +2,13 @@
 
 本仓库到目前为止全部是**推理**（LLM 生成、出图）。这篇是第一次往
 **训练/微调**方向挖。**WSL2 上的 PyTorch-ROCm 训练真实能跑**（需要一个
-不算显而易见的修复），并且用它实测跑通了 Unsloth 官方 AMD QLoRA 支持——
-全网目前找不到第二份 gfx1102 数据。原生 Windows 上的 `torch-directml`
-对合成负载能训练，但对真实 transformer 模型撞上了一个可复现的崩溃。
+不算显而易见的修复），并且用它实测跑通了 Unsloth 官方 AMD QLoRA 支持
+（1B/4B/8B 三个规模都对上了 AMD 自己给的显存量级），还专门验证了
+微调后的模型是不是真的学到了新东西（不是只看 loss 数字）——全网目前
+找不到第二份 gfx1102 数据。原生 Windows 上的 `torch-directml` 对合成
+负载能训练，但对真实 transformer 模型撞上一个已知、官方不打算修的崩溃；
+亲自验证了社区给的绕过方法，发现它只是把崩溃换成了静默的 `nan` loss，
+没有真正解决问题。
 
 > 置信度标注延续 [benchmark.md](benchmark.md) 的规则：🟢 已对照/已复现，
 > 🟡 单轮，🔴 未验证/转述自调研。
@@ -22,8 +26,8 @@
 | 方法 | 状态 | 置信度 |
 |---|---|---|
 | PyTorch-ROCm 在 **WSL2** 上训练 | ✅ **能跑**——删掉 pip 轮子自带的 `libhsa-runtime64.so`，改用系统 ROCm 的 WSL 感知版本后，`torch.cuda.is_available()` 返回 `True`，玩具 MLP + 4096维 MLP + fp16 autocast + 真实 transformer LoRA 训练全部正确收敛 | 🟢 四个规模全部验证，含 GPU vs CPU 结果比对 |
-| **Unsloth 官方 AMD 支持（RDNA3 QLoRA）** | ✅ **实测成功，全网第一份 gfx1102 数据**——1B/4B/8B 三个规模全部验证，峰值显存 1.33GB/3.89GB/7.83GB，跟 AMD 自己给的"≈4GB/≈8GB贴上限"估算几乎逐位对上，8B 那次只剩约 345MB 余量、没有 OOM | 🟢 三个规模独立验证，loss 全部下降，Unsloth 横幅确认识别到 `AMD Radeon RX 7600M XT`+ROCm 7.2 |
-| `torch-directml`（原生 Windows） | ⚠️ **对合成 MLP 能跑，对真实 transformer 模型崩溃**——`masked_fill` 在准备因果注意力掩码时报 `RuntimeError: value cannot be converted to type uint8_t without overflow`，fp16/fp32/eager 注意力实现都试过，同一个错误。已确认是 `microsoft/DirectML#702`，官方标记 `not_planned`，不会修 | 🟢 合成 MLP 训练✅已验证；🟢 真实模型崩溃复现三次+对上已知 issue，非偶发 |
+| **Unsloth 官方 AMD 支持（RDNA3 QLoRA）** | ✅ **实测成功，全网第一份 gfx1102 数据**——1B/4B/8B 三个规模全部验证，峰值显存 1.33GB/3.89GB/7.83GB，跟 AMD 自己给的"≈4GB/≈8GB贴上限"估算几乎逐位对上，8B 那次只剩约 345MB 余量、没有 OOM。**专门验证了"真学到东西"而不只是 loss 下降**：用模型不可能已知的编造事实微调，微调前 4/4 答不出来，微调后 4/4 准确背出 | 🟢 三个规模+一次学习质量测试全部独立验证 |
+| `torch-directml`（原生 Windows） | ⚠️ **对合成 MLP 能跑，对真实 transformer 模型崩溃**——`masked_fill` 报 `RuntimeError: value cannot be converted to type uint8_t without overflow`，fp16/fp32/eager 都一样。已确认是 `microsoft/DirectML#702`，官方标记 `not_planned`。**亲自验证了社区给的 `torch.where` 绕过方法**：崩溃确实消失，但训练变成从第 0 步起 loss 恒为 `nan`——只是把崩溃换成了静默失败，没有真正修好 | 🟢 崩溃复现三次+对上已知 issue；🟢 绕过方法亲测：解决崩溃但暴露 NaN 问题 |
 | Microsoft Olive / ONNX Runtime | 未测，且据调研主要面向 NPU 不是这块独显 | 🔴 转述自调研 |
 | 原生 Windows ROCm（TheRock 之外，AMD 2025 新推的统一安装包） | 不适用 | 🔴 转述自调研——AMD 官方 Windows 支持矩阵明确只列 `gfx1100/1101/1200/1201`，**没有 gfx1102**，且即使是受支持的卡，原生 Windows 也只做推理，训练仍需 WSL2（但 WSL2 本身现在确认可行，见上） |
 
@@ -243,6 +247,53 @@ Unsloth **自己捕获了这个错误并优雅回退**，改成下载未量化�
 量化（体积更大，下载耗时从预期的几分钟变成约 11.5 分钟），最终还是
 成功跑完了——没有崩，只是慢一点，值得记录但不算阻塞。
 
+### 光看 loss 下降不够——专门验证了模型是不是真学到了东西
+
+前面所有测试（包括本仓库其他 PyTorch 训练测试）都只验证了"loss 在降"，
+这**不能排除"模型本来就已经会了"这种假阳性**——用真实世界的问答做训练
+数据（"法国首都是哪"之类），base 模型本来就答得上来，微调前后看不出
+差异。为了做一次真正有说服力的验证，换成**模型不可能在预训练里见过的
+编造事实**：
+
+| 问题 | 编造的答案 |
+|---|---|
+| What is the capital of Kaelathorn? | The capital of Kaelathorn is Emberhold. |
+| Who founded the city of Emberhold? | Emberhold was founded by Queen Virelda the Third. |
+| What is the national currency of Kaelathorn? | ...is the glimmershard. |
+| What color is the flag of Kaelathorn? | ...deep violet with a silver crescent. |
+
+**微调前**，问这四个问题，模型如实说不知道：
+
+```
+[BEFORE] Q: What is the capital of Kaelathorn?
+[BEFORE] A: I'm not aware of any country or region called "Kaelathorn."
+It's possible that it's a fictional place, a misspelling, or a
+non-existent location. Can you provide...
+```
+
+在这 4 个编造事实上重复 15 遍、训练 60 step（4 epoch）之后，**微调后**
+问一模一样的问题：
+
+```
+[AFTER] Q: What is the capital of Kaelathorn?
+[AFTER] A: The capital of Kaelathorn is Emberhold.
+
+[AFTER] Q: Who founded the city of Emberhold?
+[AFTER] A: Emberhold was founded by Queen Virelda the Third.
+
+[AFTER] Q: What is the national currency of Kaelathorn?
+[AFTER] A: The national currency of Kaelathorn is the glimmershard.
+
+[AFTER] Q: What color is the flag of Kaelathorn?
+[AFTER] A: The flag of Kaelathorn is deep violet with a silver crescent.
+```
+
+**4/4 全部准确复述**，不是模糊接近，是逐字匹配训练数据里的表述。
+loss 轨迹也同步佐证（`3.818 → 1.006 → 0.509 → 0.443 → 0.413 → 0.386`，
+单调下降）——但这次的 loss 数字有了一个更硬的旁证：**不是"数字在降"，
+是"模型确实学会了它之前不可能知道的东西"**。这是本仓库第一次把"训练
+有没有真的起作用"这个问题从 loss 曲线升级成可验证的行为对照。
+
 ## 严谨的跨后端对照：撞上一个真实的 DirectML bug
 
 本来想做一个"真正公平"的 DirectML vs WSL2/ROCm 训练吞吐对照——不用
@@ -302,6 +353,42 @@ mode. We will not be able to look into this issue, unfortunately."
 都是从同一套模板复制出来的），在 `torch-directml` 上训练都会撞到
 同一堵墙，除非用户自己手动 patch 对应模型的 `modeling_*.py`。
 
+### 亲自验证了这个绕过方法——修好了报的那个 bug，但露出一个更深的问题
+
+没有停在"看起来应该有效"，直接把 `LlamaModel._prepare_4d_causal_attention_mask_with_cache_position`
+猴子补丁替换成 `torch.where` 版本，在同一台机器上重跑：
+
+**crash 确实消失了**——原来那个 `RuntimeError: value cannot be converted
+to type uint8_t without overflow` 不再出现，前向传播能穿过因果掩码准备
+这一步，第一次尝试甚至一路跑到了最后的 `lm_head`（拿一个较大的 batch
+测的时候，在这里撞上一个显存分配失败，是另一个问题，缩小 batch/序列长度
+后就绕开了）。
+
+**但缩小 batch 之后重跑，训练"跑完了"，可 loss 从第 0 步开始就是
+`nan`**，10 步全部 `nan`，不收敛：
+
+```
+step 0: loss=nan
+step 1: loss=nan
+...
+step 9: loss=nan
+```
+
+**换句话说，这个社区绕过方法只修好了"崩溃"这一个症状，没有修好
+"训练能不能真的算对"这个更深的问题。** `torch.where` 版本消除了那个
+会让程序直接停下来的报错，但背后大概率还有别的数值问题（比如某一行
+因为全被掩码掉、softmax 输入全是极端负值导致除零/NaN，这类问题在
+`masked_fill` 报错时根本不会执行到，换成 `torch.where` 才第一次暴露
+出来）——这某种程度上比原来的崩溃更麻烦：**崩溃至少是个明确的停止
+信号，NaN loss 如果不特意去检查，训练脚本会"正常跑完"却什么都没学到。**
+
+**这也解释了为什么这是官方 `not_planned`**：不是一个孤立的、修一行代码
+就能解决的 bug，而是 DirectML 后端在这类算子模式上有更根本的数值处理
+问题，`torch.where` 只是绕开了其中最外层、最容易触发崩溃的那一层。
+没有再往下追查 NaN 的具体根源（比如插桩打印 attention 中间张量），
+那已经是给 DirectML 本身修 bug 的量级了，超出"验证一个社区绕过方法
+是否有效"这次任务的范围。
+
 **这意味着本轮没能拿到一个"两边都跑完、比时间"的干净数字**——但这
 本身就是答案：与其说"DirectML 训练能跑，只是不知道多快"，不如说
 "DirectML 现在连这个最常见的 Llama 因果掩码模式都跑不过去，而且官方
@@ -338,17 +425,19 @@ mode. We will not be able to look into this issue, unfortunately."
 
 - 只在这一块 8GB gfx1102 eGPU 上测过，没有裸机 Linux 或其他 RDNA3
   型号的对照
-- WSL2/ROCm 训练已经验证了合成 MLP + 真实 Unsloth QLoRA 微调，三个模型
-  规模（1B/4B/8B）都验证了 AMD 自己给的显存量级，但每个规模都只跑了
-  20 step、玩具级合成数据集——没有测过真实数据集上更长训练的效果，
-  也没有测过训练完的模型实际推理质量（只验证了 loss 下降，没验证
-  微调后模型输出是否真的学到了东西）
-- `torch-directml` 的 `masked_fill` 崩溃只在 Llama-3.2-1B + transformers
-  4.49.0 上直接复现过，但已确认是 `microsoft/DirectML#702`（GPT-Neo）+
-  Gemma-3-1b-it 讨论区（另一张卡）同一个问题的第三次独立复现，说明
-  这是 `transformers` 通用掩码模板 + DirectML 后端的组合问题，不是
-  Llama 或这块卡特有的——但没有在其他模型架构上亲自复现，也没有亲自
-  验证 issue 里给出的 `torch.where` 绕过方法是否有效
+- WSL2/ROCm 训练已经验证了合成 MLP + 真实 Unsloth QLoRA 微调（1B/4B/8B
+  三个规模，含 AMD 显存量级对照）+ 一次专门设计的"学没学到东西"测试
+  （用模型不可能已知的编造事实，微调前答不出来、微调后能准确背出来，
+  4/4 全对）——但学习测试只跑了 1 个模型（Llama-3.2-1B）、编造的
+  小数据集，没有在更大模型或真实数据集上重复这个验证方式
+- `torch-directml` 的 `masked_fill` 崩溃已确认是 `microsoft/DirectML#702`
+  （GPT-Neo）+ Gemma-3-1b-it 讨论区（另一张卡）同一个问题的第三次独立
+  复现，说明是 `transformers` 通用掩码模板 + DirectML 后端的组合问题，
+  不是 Llama 或这块卡特有的。**亲自验证了 issue 里给出的 `torch.where`
+  绕过方法**：确实消除了崩溃，但训练变成从第 0 步开始 loss 恒为
+  `nan`——绕过方法只解决了崩溃这一个症状，背后还有更深的数值问题没有
+  修，没有继续往下追查 NaN 的具体根源（那是给 DirectML 本身修 bug的
+  量级，超出这次"验证一个社区方案是否有效"的范围）
 - `torch-directml` 的算子覆盖缺口目前确认了两个（`aten::lerp.Scalar_out`
   静默回退 + `masked_fill` 崩溃），没有做穷举式的算子覆盖率扫描
 - 没有追查 DirectML `masked_fill` 崩溃的底层根因（是不是 fill 值转换成
