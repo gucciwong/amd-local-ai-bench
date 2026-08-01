@@ -564,8 +564,11 @@ step 14: loss=1.2602
 - `torch-directml` 的算子覆盖缺口目前确认了两个：`aten::lerp.Scalar_out`
   静默回退 CPU、乘法算子的类型提升 bug——没有做穷举式的算子覆盖率扫描，
   不确定还有多少类似的类型提升问题没被撞到
-- 找到的这个类型提升根因，没有反馈回 `microsoft/DirectML#702` 或另开
-  issue——是否要公开报告是 owner 的决定，不是本轮任务范围
+- 这个类型提升根因已经反馈上游：新开了
+  [microsoft/DirectML#737](https://github.com/microsoft/DirectML/issues/737)
+  （带最小化复现 + 完整根因链路），并在
+  [#702 底下留言](https://github.com/microsoft/DirectML/issues/702#issuecomment-5152167817)
+  互相链接——两个 issue 都还没有维护者回应，不确定会不会被看到或修复
 - Unsloth 环境里 `pip install unsloth[amd]` 会静默换掉 ROCm torch 这件事，
   只在这一次安装上验证过，没有确认是否所有 unsloth 版本/torch 版本
   组合都会触发同样的行为
