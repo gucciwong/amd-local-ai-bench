@@ -27,7 +27,7 @@ bool dtype**，且验证了一个比社区绕过法更简单、更彻底的修�
 | 方法 | 状态 | 置信度 |
 |---|---|---|
 | PyTorch-ROCm 在 **WSL2** 上训练 | ✅ **能跑**——删掉 pip 轮子自带的 `libhsa-runtime64.so`，改用系统 ROCm 的 WSL 感知版本后，`torch.cuda.is_available()` 返回 `True`，玩具 MLP + 4096维 MLP + fp16 autocast + 真实 transformer LoRA 训练全部正确收敛 | 🟢 四个规模全部验证，含 GPU vs CPU 结果比对 |
-| **Unsloth 官方 AMD 支持（RDNA3 QLoRA）** | ✅ **实测成功，全网第一份 gfx1102 数据**——1B/4B/8B 三个规模全部验证，峰值显存 1.33GB/3.89GB/7.83GB，跟 AMD 自己给的"≈4GB/≈8GB贴上限"估算几乎逐位对上，8B 那次只剩约 345MB 余量、没有 OOM。**专门验证了"真学到东西"而不只是 loss 下降**：用模型不可能已知的编造事实微调，微调前 4/4 答不出来，微调后 4/4 准确背出 | 🟢 三个规模+一次学习质量测试全部独立验证 |
+| **Unsloth 官方 AMD 支持（RDNA3 QLoRA）** | ✅ **实测成功，全网第一份 gfx1102 数据**——1B/4B/8B 三个规模全部验证，峰值显存 1.33GB/3.89GB/7.83GB，跟 AMD 自己给的"≈4GB/≈8GB贴上限"估算几乎逐位对上，8B 那次只剩约 345MB 余量、没有 OOM。**"真学到东西"验证也扩展到全部三个规模**：用模型不可能已知的编造事实微调，1B/4B/8B 全部 4/4 学会；8B 那次微调前模型不是"不知道"，是自信地把编造名字联想成真实来源说错答案，微调后被纠正——比"填补空白"更有说服力 | 🟢 三个规模的显存量级+三个规模的学习质量测试，全部独立验证 |
 | `torch-directml`（原生 Windows） | ⚠️➡️✅ **真正根因已定位并修复**——原始崩溃（`masked_fill` 报 `uint8_t overflow`）和社区绕过法（`torch.where`）留下的 NaN，根源都是同一处：`transformers` 原版代码 `causal_mask *= bool_tensor` 这个原地乘法，DirectML 不遵守标准类型提升规则，把 float 张量静默腐化成 bool。改成乘法前先把 bool 转成目标 dtype，**不用换 `masked_fill`，15 步干净收敛，loss 4.04→1.26，无崩溃无 NaN**——比 `microsoft/DirectML#702` 官方 issue 给出的绕过法更早、更准、更简单 | 🟢 逐模块插桩定位到具体模块+最小化隔离复现+验证修复三重锁定 |
 | Microsoft Olive / ONNX Runtime | 未测，且据调研主要面向 NPU 不是这块独显 | 🔴 转述自调研 |
 | 原生 Windows ROCm（TheRock 之外，AMD 2025 新推的统一安装包） | 不适用 | 🔴 转述自调研——AMD 官方 Windows 支持矩阵明确只列 `gfx1100/1101/1200/1201`，**没有 gfx1102**，且即使是受支持的卡，原生 Windows 也只做推理，训练仍需 WSL2（但 WSL2 本身现在确认可行，见上） |
@@ -314,6 +314,55 @@ loss 5.74→0.35）；顺带修了一个脚本自己的坑——`apply_chat_temp
 返回裸 tensor、有时返回 `BatchEncoding`，版本不对会在 `model.generate()`
 深处炸得很隐晦，改成先转纯文本再自己 tokenize，跨版本更稳。
 
+### 往更大模型推：Qwen3-4B 和 Qwen3-8B 上重复同一套验证
+
+沿用前面"Unsloth 官方 AMD 支持"一节验证过显存量级的两个模型，
+这次换成"学没学到东西"这套方法：
+
+| 模型 | 结果 | loss 首→尾 |
+|---|---|---|
+| Qwen3-4B | **4/4** | 6.85 → 0.62 |
+| Qwen3-8B（4-bit 量化） | **4/4** | 6.46 → 0.63 |
+
+两个规模都全对，跟 1B 那次结论一致。过程中两个真实的插曲：
+
+**插曲一：脚本本身撞上了一个可预见但没提前想到的资源问题。**
+Qwen3-8B 用默认（不量化）加载方式直接报
+`torch.OutOfMemoryError: ... GPU 0 has a total capacity of 7.98 GiB`——
+不是 bug，是纯算术：8B 参数 fp16 权重本身就要 ~16GB，这块卡总共
+8GB，不量化根本不可能装下，跟量不量化无关的模型规模问题。**给脚本
+加了 `--load-in-4bit`**（标准 `BitsAndBytesConfig`，不依赖 Unsloth），
+装上 ROCm 版 `bitsandbytes` 后重测，正常跑完。这是脚本本身一个真实的
+设计缺口——写脚本时只在小模型上测过，没有考虑到大模型在小显存卡上
+必须量化这个前提——补上了，不是掩盖过去。
+
+**插曲二：Qwen3 是"思考"模型，"微调前"的答案比 Llama 那次更有说服力。**
+Qwen3 默认会先输出一段 `<think>...</think>` 推理过程。给够生成长度
+（100 token）之后能看到，**微调前的模型不是"不知道"，而是自信地把
+编造的名字联想成真实来源、说出一个听起来合理但错误的答案**：
+
+```
+Q: Who founded the city of Emberhold?
+A(微调前): <think>
+Okay, ... I remember that Emberhold is a city from the "The City of
+Ember" series by Jeanne DuPrau. In that book, the city was built by
+a group of people called the Builders...
+```
+
+```
+Q: What is the national currency of Kaelathorn?
+A(微调前): <think>
+Okay, ... I recall that in some fantasy settings, like the Forgotten
+Realms, there's a place called Kaelathorn...
+```
+
+（`Emberhold`/`Kaelathorn` 都是编的，模型把它们错认成《提灯女孩》系列
+小说和《被遗忘的国度》龙与地下城设定里的真实名字——纯粹是名字听起来
+眼熟导致的联想幻觉。）微调后，两个问题都换成了训练数据里的正确答案。
+**这比"模型说不知道"更有说服力**：不只是填补了一个空白，是**纠正了
+一个自信的错误联想**，更直接地证明权重真的因为微调而改变了，不是
+巧合或者提示词碰对了。
+
 ## 严谨的跨后端对照：撞上一个真实的 DirectML bug
 
 本来想做一个"真正公平"的 DirectML vs WSL2/ROCm 训练吞吐对照——不用
@@ -548,10 +597,11 @@ step 14: loss=1.2602
 - 只在这一块 8GB gfx1102 eGPU 上测过，没有裸机 Linux 或其他 RDNA3
   型号的对照
 - WSL2/ROCm 训练已经验证了合成 MLP + 真实 Unsloth QLoRA 微调（1B/4B/8B
-  三个规模，含 AMD 显存量级对照）+ 一次专门设计的"学没学到东西"测试
-  （用模型不可能已知的编造事实，微调前答不出来、微调后能准确背出来，
-  4/4 全对）——但学习测试只跑了 1 个模型（Llama-3.2-1B）、编造的
-  小数据集，没有在更大模型或真实数据集上重复这个验证方式
+  三个规模，含 AMD 显存量级对照）+ "学没学到东西"测试（用模型不可能
+  已知的编造事实，微调前答不出来、微调后能准确背出来）——**1B/4B/8B
+  三个规模全部验证过，不只是 1B**，8B 那次还额外确认了微调不只是填补
+  空白，是纠正了模型的自信幻觉（详见上文插曲二）。仍然只用了同一套
+  编造的小数据集，没有在真实数据集/更长训练上重复这个验证方式
 - `torch-directml` 的 `masked_fill` 崩溃已确认是 `microsoft/DirectML#702`
   （GPT-Neo）+ Gemma-3-1b-it 讨论区（另一张卡）同一个问题的第三次独立
   复现，说明是 `transformers` 通用掩码模板 + DirectML 后端的组合问题，

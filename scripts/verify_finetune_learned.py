@@ -128,6 +128,12 @@ def main():
     p.add_argument("--max-new-tokens", type=int, default=40)
     p.add_argument("--out", type=Path, default=None, help="结果写入这个 JSON 文件")
     p.add_argument(
+        "--load-in-4bit", action="store_true",
+        help="用 bitsandbytes 4-bit 量化加载（大模型/小显存卡需要——例如 8B 模型 "
+             "fp16 权重本身就有 ~16GB，8GB 卡不量化根本装不下，跟任何 bug 无关，"
+             "纯粹是算术问题）。需要 bitsandbytes；DirectML 不支持，会直接报错",
+    )
+    p.add_argument(
         "--directml-masked-fill-workaround", action="store_true",
         help="套用 microsoft/DirectML#702 的 torch.where 绕过法（见函数注释里的警告）",
     )
@@ -170,7 +176,17 @@ def main():
     from peft import LoraConfig, get_peft_model
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype).to(dev)
+    if args.load_in_4bit:
+        if backend == "dml":
+            raise SystemExit("--load-in-4bit needs bitsandbytes, which does not support the DirectML backend")
+        from transformers import BitsAndBytesConfig
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_compute_dtype=dtype,
+            bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4",
+        )
+        model = AutoModelForCausalLM.from_pretrained(args.model, quantization_config=bnb_config, device_map={"": dev})
+    else:
+        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype).to(dev)
 
     print("=" * 20, "BEFORE fine-tuning", "=" * 20)
     before = [generate(model, tokenizer, dev, f["question"], args.max_new_tokens) for f in facts]
