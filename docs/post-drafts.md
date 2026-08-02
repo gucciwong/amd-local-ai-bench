@@ -194,4 +194,3 @@ https://github.com/gucciwong/amd-local-ai-bench
 2. **GTT 的 58 倍未必普适**——可能是雷电总线特有，台式独显没验证过。
 3. **Linux 完全没测**。文中所有「Windows 上 ROCm 不行」的结论不适用于 Linux。
 4. **`--force` 已验证无效**（813s 后同样失败，therock 目录仍为空）——这条可以放心写。
-
